@@ -431,12 +431,10 @@ async def deal_auto_payment_watcher(deal_id: str):
         if payment_id:
             try:
                 chk = await check_payment_status_async(payment_id)
-                if chk and chk.get("paid"):
-                    paid_amt = int(chk.get("amount") or chk.get("raw", {}).get("amount", 0) or deal["total_to_pay"])
-                    if paid_amt >= int(deal["total_to_pay"]):
-                        logger.info(f"Avtomatik tezkor to'lov aniqlandi: #{deal_id}, Summa: {paid_amt}")
-                        await activate_paid_deal(deal_id)
-                        return
+                if chk and chk.get("paid") is True and not chk.get("raw", {}).get("test", False):
+                    logger.info(f"Avtomatik tezkor to'lov aniqlandi: #{deal_id}")
+                    await activate_paid_deal(deal_id)
+                    return
             except Exception as e:
                 logger.error(f"Watcher tekshiruv xatosi (#{deal_id}): {e}")
 
@@ -456,6 +454,67 @@ async def deal_auto_payment_watcher(deal_id: str):
             )
         except Exception:
             pass
+
+async def global_payment_watcher_loop():
+    """
+    Doimiy ishlovchi fon xizmati:
+    Har 5 soniyada bazadagi barcha 'waiting_payment' holatidagi bitimlarni
+    TolovAPI orqali tekshirib boradi.
+    1. Agar to'lov qilingan bo'lsa (paid) -> Foydalanuvchi tugma bosishini kutmasdan darhol savdoni faollashtiradi!
+    2. Agar hisob ochilganiga 5 daqiqa (300 soniya) dan oshgan bo'lsa -> Bitimni avtomatik bekor qiladi va xaridorni ogohlantiradi.
+    Render qayta ishga tushganda (restart) ham barcha ochiq bitimlarni avtomatik o'z nazoratiga oladi.
+    """
+    logger.info("Global TolovAPI to'lov kuzatuvchisi (watcher) loopi faollashtirildi.")
+    while True:
+        try:
+            await asyncio.sleep(5)
+            pending_deals = db.q("SELECT * FROM deals WHERE status='waiting_payment'")
+            if not pending_deals:
+                continue
+
+            now_dt = datetime.now(TZ)
+
+            for deal in pending_deals:
+                deal_id = deal["deal_id"]
+                payment_id = deal.get("payment_id")
+                if not payment_id:
+                    continue
+
+                # 1. TolovAPI dan holatni tekshirish
+                try:
+                    chk = await check_payment_status_async(payment_id)
+                    if chk and chk.get("paid") is True and not chk.get("raw", {}).get("test", False):
+                        logger.info(f"Global watcher: To'lov muvaffaqiyatli aniqlandi: #{deal_id}")
+                        await activate_paid_deal(deal_id)
+                        continue
+                except Exception as ex:
+                    logger.error(f"Global watcher tekshiruv xatosi (#{deal_id}): {ex}")
+
+                # 2. 5 daqiqa (300 soniya) dan oshgan bo'lsa - bekor qilish
+                created_str = deal.get("payment_created_at") or deal.get("created_at")
+                age_seconds = 0
+                if created_str:
+                    try:
+                        c_dt = datetime.fromisoformat(created_str)
+                        age_seconds = (now_dt - c_dt).total_seconds()
+                    except Exception:
+                        age_seconds = 0
+
+                if age_seconds > 300:
+                    now_s = now_dt.isoformat()
+                    db.q("UPDATE deals SET status='cancelled', updated_at=? WHERE deal_id=?", (now_s, deal_id), commit=True)
+                    await cancel_payment_async(payment_id)
+                    try:
+                        await bot.send_message(
+                            deal["buyer_id"],
+                            f"⏱ <b>5 DAQIQA VAQT TUGADI! (#{deal_id})</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                            f"Belgilangan 5 daqiqa ichida to'lov qilinmagani sababli to'lov hisobi avtomatik <b>bekor qilindi</b>."
+                        )
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.error(f"global_payment_watcher_loop xatosi: {e}")
 
 deal_5min_timer = deal_auto_payment_watcher
 
@@ -1420,12 +1479,12 @@ async def process_deal_amount(msg: Message, state: FSMContext):
         f"👉 <code>{card_num}</code>\n"
         f"<i>(Karta ustiga bosing — avtomatik nusxalanadi!)</i>\n"
         f"👤 <b>Qabul qiluvchi:</b> <b>{esc_html(card_own)}</b>\n\n"
-        f"💰 <b>O'TKAZILADIGAN ANIQ SUMMA (Komissiya bilan):</b>\n"
+        f"💰 <b>O'TKAZILADIGAN ANIQ SUMMA:</b>\n"
         f"👉 <code>{fmt(exact_amount)} so'm</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"⚠️ <b>DIQQAT! JUDA MUHIM:</b>\n"
-        f"Aynan <b>{fmt(exact_amount)} so'm</b>ni aniq o'tkazing! Kam yoki ortiq to'lasangiz, tizim to'lovni avtomatik tasdiqlay olmaydi.\n\n"
-        f"⚡️ <i>To'lov o'tkazilishi bilan bot avtomatik aniqlaydi. Agar o'tmasa, quyidagi «✅ To'lov qildim» tugmasini bosing (bot 20 soniya davomida faol tekshiradi).</i>\n"
+        f"To'lov avtomatik tasdiqlanishi uchun aynan <b>{fmt(exact_amount)} so'm</b> (tiyinigacha aniq) o'tkazing! Kam yoki ortiq to'lasangiz, tizim to'lovni avtomatik tasdiqlay olmaydi.\n\n"
+        f"⚡️ <i>To'lov o'tkazilishi bilanoq bot avtomatik aniqlaydi. Agar o'tmasa, quyidagi «✅ To'lov qildim (Tekshirish)» tugmasini bosing (bot 45 soniya davomida faol tekshiradi).</i>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
     kb = []
@@ -1459,34 +1518,32 @@ async def i_paid_callback_step(call: CallbackQuery, state: FSMContext):
         return
 
     if d_id in _active_checking_deals:
-        await call.answer("⏳ To'lov tekshirilmoqda, 20 soniya kuting...", show_alert=True)
+        await call.answer("⏳ To'lov tekshirilmoqda, 45 soniya kuting...", show_alert=True)
         return
 
     _active_checking_deals.add(d_id)
     try:
         # 1. Tezkor birinchi tekshiruv (0-soniya)
         chk = await check_payment_status_async(payment_id)
-        if chk and chk.get("paid"):
-            paid_amt = int(chk.get("amount") or chk.get("raw", {}).get("amount", 0) or deal["total_to_pay"])
-            if paid_amt >= int(deal["total_to_pay"]):
-                await call.answer("✅ To'lov muvaffaqiyatli qabul qilindi!", show_alert=True)
-                await activate_paid_deal(d_id, edit_call=call, state=state)
-                return
+        if chk and chk.get("paid") is True and not chk.get("raw", {}).get("test", False):
+            await call.answer("✅ To'lov muvaffaqiyatli qabul qilindi!", show_alert=True)
+            await activate_paid_deal(d_id, edit_call=call, state=state)
+            return
 
-        # 2. Agar hali tushmagan bo'lsa: 20 soniyalik monitoring
-        await call.answer("🔍 To'lov tekshirilmoqda (20 soniya davomida)...", show_alert=False)
+        # 2. Agar hali tushmagan bo'lsa: 45 soniyalik monitoring
+        await call.answer("🔍 To'lov tekshirilmoqda (45 soniya davomida)...", show_alert=False)
 
         status_msg = await call.message.answer(
             f"⏳ <b>TO'LOV TIZIMI TEKSHIRILMOQDA... (#{d_id})</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"Kartangizga <b>{fmt(deal['total_to_pay'])} so'm</b> tushgani qidirilmoqda...\n"
-            f"<i>Bank va SMS xabarlari yetib kelishi uchun 20 soniya davomida har 2 soniyada uzluksiz tekshiriladi. Iltimos, kuting...</i>"
+            f"<i>Bank va SMS xabarlari yetib kelishi uchun 45 soniya davomida har 2 soniyada uzluksiz tekshiriladi. Iltimos, kuting...</i>"
         )
 
         start_time = time.time()
         is_success = False
 
-        while (time.time() - start_time) < 20:
+        while (time.time() - start_time) < 45:
             await asyncio.sleep(2)
             curr = db.get_deal(d_id)
             if curr and curr["status"] != "waiting_payment":
@@ -1494,11 +1551,9 @@ async def i_paid_callback_step(call: CallbackQuery, state: FSMContext):
                 break
 
             chk = await check_payment_status_async(payment_id)
-            if chk and chk.get("paid"):
-                paid_amt = int(chk.get("amount") or chk.get("raw", {}).get("amount", 0) or deal["total_to_pay"])
-                if paid_amt >= int(deal["total_to_pay"]):
-                    is_success = True
-                    break
+            if chk and chk.get("paid") is True and not chk.get("raw", {}).get("test", False):
+                is_success = True
+                break
 
         try:
             await status_msg.delete()
@@ -1520,7 +1575,7 @@ async def i_paid_callback_step(call: CallbackQuery, state: FSMContext):
             time_txt = f"{exp_in} soniya qoldi" if exp_in and exp_in > 0 else "muddati tugagan (5 daqiqa o'tib ketgan)"
             card_show = format_card(db.get_setting("card_number", DEFAULT_CARD_NUMBER))
             await call.message.answer(
-                f"❌ <b>20 SONIYA DAVOMIDA TO'LOV ANIQLANMADI! (#{d_id})</b>\n"
+                f"❌ <b>45 SONIYA DAVOMIDA TO'LOV ANIQLANMADI! (#{d_id})</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"📊 <b>TolovAPI tizimidan olingan ma'lumot:</b>\n"
                 f"• <b>Tizim holati:</b> <code>{api_status}</code>\n"
@@ -1533,7 +1588,7 @@ async def i_paid_callback_step(call: CallbackQuery, state: FSMContext):
                 f"3️⃣ <b>Karta:</b> Aynan ko'rsatilgan <code>{card_show}</code> kartasiga o'tkazildimi?\n\n"
                 f"<i>💡 Agar pul kartadan yechilgan bo'lsa, birozdan so'ng «🔄 Qayta tekshirish» tugmasini bosing yoki yangi savdo oching.</i>",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="🔄 Qayta tekshirish (20 soniya)", callback_data=f"i_paid:{d_id}")],
+                    [InlineKeyboardButton(text="🔄 Qayta tekshirish (45 soniya)", callback_data=f"i_paid:{d_id}")],
                     [InlineKeyboardButton(text="❌ Bekor qilish", callback_data=f"cancel_deal:{d_id}")]
                 ])
             )
@@ -2651,6 +2706,7 @@ async def run_render_web_server():
 # ============================ 20. ASOSIY ISHGA TUSHIRISH (MAIN) ============================
 async def main():
     await run_render_web_server()
+    asyncio.create_task(global_payment_watcher_loop())
     asyncio.create_task(complaints_auto_expire_loop())
     asyncio.create_task(referral_leave_checker_loop())
     logger.info(f"Kafil / Garant Boti to'liq ishga tushdi! Adminlar: {ADMIN_IDS}")
