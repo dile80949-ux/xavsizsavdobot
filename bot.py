@@ -1515,14 +1515,23 @@ async def i_paid_callback_step(call: CallbackQuery, state: FSMContext):
             except Exception:
                 pass
         else:
+            api_status = chk.get("status") if chk else "javob berilmadi"
+            exp_in = chk.get("raw", {}).get("expires_in") if chk else None
+            time_txt = f"{exp_in} soniya qoldi" if exp_in and exp_in > 0 else "muddati tugagan (5 daqiqa o'tib ketgan)"
+            card_show = format_card(db.get_setting("card_number", DEFAULT_CARD_NUMBER))
             await call.message.answer(
                 f"❌ <b>20 SONIYA DAVOMIDA TO'LOV ANIQLANMADI! (#{d_id})</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"TolovAPI tizimida ko'rsatilgan kartaga to'lovingiz hali kelib tushmadi.\n\n"
-                f"📌 <b>Iltimos tekshiring:</b>\n"
-                f"1️⃣ Ko'rsatilgan kartaga aynan <b>{fmt(deal['total_to_pay'])} so'm</b> o'tkazildimi?\n"
-                f"2️⃣ Mablag' bankingizdan (Click / Payme) to'liq yechildimi?\n\n"
-                f"<i>💡 Agar to'lovni hozirgina o'tkazgan bo'lsangiz, bank SMS xabari kelishi uchun yana biroz vaqt ketishi mumkin. Qaytadan tekshirish uchun quyidagi tugmani bosing:</i>",
+                f"📊 <b>TolovAPI tizimidan olingan ma'lumot:</b>\n"
+                f"• <b>Tizim holati:</b> <code>{api_status}</code>\n"
+                f"• <b>Kutilayotgan summa:</b> <b>{fmt(deal['total_to_pay'])} so'm</b>\n"
+                f"• <b>Hisob muddati:</b> <i>{time_txt}</i>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"📌 <b>Nega to'lov tasdiqlanmayapti?</b>\n"
+                f"1️⃣ <b>Summa farqi:</b> Kartaga aynan <b>{fmt(deal['total_to_pay'])} so'm</b> o'tkazildimi? (Agar komissiyasiz yoki boshqa summa o'tkazilsa, TolovAPI hisobni bog'lay olmaydi).\n"
+                f"2️⃣ <b>5 daqiqalik vaqt:</b> Agar hisob ochilganiga 5 daqiqadan oshgan bo'lsa, TolovAPI hisobni avtomatik bekor qiladi.\n"
+                f"3️⃣ <b>Karta:</b> Aynan ko'rsatilgan <code>{card_show}</code> kartasiga o'tkazildimi?\n\n"
+                f"<i>💡 Agar pul kartadan yechilgan bo'lsa, birozdan so'ng «🔄 Qayta tekshirish» tugmasini bosing yoki yangi savdo oching.</i>",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                     [InlineKeyboardButton(text="🔄 Qayta tekshirish (20 soniya)", callback_data=f"i_paid:{d_id}")],
                     [InlineKeyboardButton(text="❌ Bekor qilish", callback_data=f"cancel_deal:{d_id}")]
