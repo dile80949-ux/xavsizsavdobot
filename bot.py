@@ -10,6 +10,7 @@ import random
 import string
 import logging
 import asyncio
+import requests
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any, Tuple
 
@@ -81,8 +82,13 @@ class MandatorySubMiddleware(BaseMiddleware):
             return await handler(event, data)
 
         uid = user.id
+
+        # Admin panel boshqaruvi va kanallarni sozlash uchun adminga ruxsat berish
         if is_admin(uid):
-            return await handler(event, data)
+            if isinstance(event, Message) and event.text and (event.text.startswith("/admin") or "Admin" in event.text or "👑" in event.text):
+                return await handler(event, data)
+            if isinstance(event, CallbackQuery) and event.data and event.data.startswith("adm_"):
+                return await handler(event, data)
 
         # check_sub callbackiga ruxsat berish
         if isinstance(event, CallbackQuery) and event.data == "check_sub":
@@ -110,7 +116,7 @@ class MandatorySubMiddleware(BaseMiddleware):
             if isinstance(event, Message):
                 await event.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
             elif isinstance(event, CallbackQuery):
-                await event.answer("⚠️ Avval kanallarga a'zo bo'ling!", show_alert=True)
+                await event.answer("⚠️ Avval barcha kanallarga a'zo bo'ling!", show_alert=True)
                 try:
                     await event.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
                 except Exception:
@@ -186,34 +192,34 @@ class AdminFSM(StatesGroup):
 # ============================ 4. TOLOVAPI.UZ INTEGRATSIYASI ============================
 _active_checking_deals = set()
 
-async def tolovapi_request(path: str, params: dict, method: str = "POST", timeout_sec: int = 10) -> dict:
-    """TolovAPI.uz rasmiy API mijoz funksiyasi (X-Shop-Key sarlavhasi bilan)."""
+def tolovapi_sync_request(path: str, params: dict, method: str = "POST", timeout: int = 15) -> dict:
+    """TolovAPI.uz rasmiy API mijozi (X-Shop-Key sarlavhasi bilan)."""
     url = f"{TOLOV_API_URL.rstrip('/')}/{path.lstrip('/')}"
-    headers = {"X-Shop-Key": SHOP_KEY}
-    full_params = {"shop_id": int(SHOP_ID) if str(SHOP_ID).isdigit() else SHOP_ID, **params}
-    timeout = ClientTimeout(total=timeout_sec)
+    full_params = {"shop_id": str(SHOP_ID), **params}
+    headers = {"X-Shop-Key": str(SHOP_KEY)}
     try:
-        async with ClientSession(timeout=timeout) as session:
-            if method.upper() == "GET":
-                async with session.get(url, params=full_params, headers=headers) as resp:
-                    return await resp.json()
-            else:
-                async with session.post(url, json=full_params, headers=headers) as resp:
-                    return await resp.json()
+        if method.upper() == "GET":
+            r = requests.get(url, params=full_params, headers=headers, timeout=timeout)
+        else:
+            r = requests.post(url, json=full_params, headers=headers, timeout=timeout)
+        return r.json()
     except Exception as exc:
         logger.error(f"TolovAPI xatosi ({path}): {exc}")
         return {"ok": False, "error": str(exc)}
 
+async def tolovapi_request(path: str, params: dict, method: str = "POST", timeout_sec: int = 15) -> dict:
+    return await asyncio.to_thread(tolovapi_sync_request, path, params, method, timeout_sec)
+
 async def create_payment_async(amount: int, order_id: Optional[str] = None, user_id: Optional[int] = None) -> Optional[dict]:
     """TolovAPI orqali yangi to'lov hisobini ochish."""
     oid = str(order_id) if order_id else f"ORD{random.randint(100000, 999999)}"
-    res = await tolovapi_request("payment/create", {"amount": int(amount), "order_id": oid}, timeout_sec=12)
+    res = await tolovapi_request("payment/create", {"amount": int(amount), "order_id": oid}, method="POST", timeout_sec=15)
 
     if res.get("error_code") == "amount_busy" or res.get("error") == "amount_busy":
         suggested = res.get("suggested_amount")
         if suggested and int(suggested) != amount:
-            logger.info(f"TolovAPI: {amount} summa band, taklif: {suggested} bilan qayta ochilmoqda...")
-            res = await tolovapi_request("payment/create", {"amount": int(suggested), "order_id": oid}, timeout_sec=12)
+            logger.info(f"TolovAPI: {amount} summa band, taklif: {suggested} bilan ochilmoqda...")
+            res = await tolovapi_request("payment/create", {"amount": int(suggested), "order_id": oid}, method="POST", timeout_sec=15)
 
     if res.get("ok") or res.get("payment_id"):
         return {
@@ -233,13 +239,14 @@ async def check_payment_status_async(payment_id: str) -> Optional[dict]:
     """TolovAPI orqali to'lov holatini tekshirish (GET orqali)."""
     if not payment_id:
         return None
-    res = await tolovapi_request("payment/status", {"payment_id": str(payment_id)}, method="GET", timeout_sec=5)
+    res = await tolovapi_request("payment/status", {"payment_id": str(payment_id)}, method="GET", timeout_sec=10)
     st = str(res.get("status", "")).lower()
     return {
         "ok": res.get("ok", False) or (st in ("paid", "pending", "success")),
         "paid": (st in ("paid", "success")),
         "status": st,
         "amount": res.get("amount"),
+        "card_number": res.get("card_number"),
         "raw": res
     }
 
@@ -258,11 +265,17 @@ async def check_user_subscribed(user_id: int) -> Tuple[bool, List[dict]]:
     unsubscribed = []
     for ch in channels:
         try:
-            member = await bot.get_chat_member(chat_id=ch["channel_id"], user_id=user_id)
-            if member.status not in ("creator", "administrator", "member", "restricted"):
+            raw_cid = ch["channel_id"]
+            cid = int(raw_cid) if str(raw_cid).lstrip("-").isdigit() else raw_cid
+            member = await bot.get_chat_member(chat_id=cid, user_id=user_id)
+            if member.status in ("creator", "administrator", "member", "restricted"):
+                continue
+            else:
                 unsubscribed.append(dict(ch))
-        except Exception:
-            pass
+        except Exception as e:
+            # Agar foydalanuvchi kanalda bo'lmasa yoki Telegram xatolik qaytarsa:
+            logger.warning(f"Kanalga a'zolikni tekshirish xatosi (user={user_id}, ch={ch.get('channel_title')}): {e}")
+            unsubscribed.append(dict(ch))
     return (len(unsubscribed) == 0), unsubscribed
 
 async def reward_referral_if_eligible(referred_id: int):
@@ -610,11 +623,14 @@ async def callback_check_sub(call: CallbackQuery):
     uid = call.from_user.id
     is_sub, missing = await check_user_subscribed(uid)
     if not is_sub:
-        await call.answer("⚠️ Hali barcha kanallarga a'zo bo'lmadingiz!", show_alert=True)
+        await call.answer("⚠️ Hali barcha kanallarga a'zo bo'lmadingiz! Iltimos, ko'rsatilgan kanallarga a'zo bo'lib qayta bosing.", show_alert=True)
         return
     await call.answer("✅ Rahmat! Obuna tasdiqlandi.", show_alert=False)
     await reward_referral_if_eligible(uid)
-    await call.message.delete()
+    try:
+        await call.message.delete()
+    except Exception:
+        pass
     await call.message.answer(
         "🎉 <b>Obuna muvaffaqiyatli tasdiqlandi!</b>\nKafil botining barcha imkoniyatlaridan to'liq foydalanishingiz mumkin.",
         reply_markup=main_menu_keyboard(uid)
@@ -1316,15 +1332,12 @@ async def process_deal_seller(msg: Message, state: FSMContext):
     await state.update_data(seller_username=clean_seller)
     await state.set_state(CreateDealFSM.amount)
 
-    buyer = db.get_user(msg.from_user.id)
-    is_first = (buyer and buyer["completed_deals"] == 0)
-    fee_notice = "🎁 <b>Siz birinchi marta foydalanayotganingiz uchun xizmat haqi 0% MUTLAQO BEPUL!</b>" if is_first else "ℹ️ Xizmat komissiyasi: 10%"
-
+    comm_pct = int(db.get_setting("commission_percent", 10))
     await msg.answer(
         f"Sotuvchi: <b>@{esc_html(clean_seller)}</b> (Xavfsiz ✅)\n\n"
         f"💵 <b>To'lov summasini kiriting (so'mda):</b>\n"
-        f"<i>(Eng kam summa 1 000 so'm, eng ko'p summa 100 000 so'm)</i>\n\n"
-        f"{fee_notice}"
+        f"<i>(Eng kam summa: 1 000 so'm, eng ko'p summa: 5 000 000 so'm)</i>\n\n"
+        f"ℹ️ Xizmat komissiyasi: {comm_pct}%"
     )
 
 @router.message(CreateDealFSM.amount)
@@ -1337,7 +1350,7 @@ async def process_deal_amount(msg: Message, state: FSMContext):
     is_valid, err_msg, clean_amount = validate_user_input(
         "deal_amount",
         msg.text,
-        {"min_limit": 1000, "max_limit": 100000}
+        {"min_limit": 1000, "max_limit": 5000000000}
     )
     if not is_valid:
         await msg.answer(err_msg)
@@ -1351,9 +1364,8 @@ async def process_deal_amount(msg: Message, state: FSMContext):
     mode = data["trade_mode"]
     uid = msg.from_user.id
 
-    buyer = db.get_user(uid)
-    is_first = (buyer and buyer["completed_deals"] == 0)
-    fee = 0 if is_first else int(amount * 0.10)
+    comm_pct = int(db.get_setting("commission_percent", 10))
+    fee = int(amount * comm_pct / 100)
     total_to_pay = amount + fee
 
     deal_id = generate_deal_id()
@@ -1394,7 +1406,7 @@ async def process_deal_amount(msg: Message, state: FSMContext):
 
     card_num = format_card((pay_res and pay_res.get("card_number")) or db.get_setting("card_number", DEFAULT_CARD_NUMBER))
     card_own = db.get_setting("card_owner", DEFAULT_CARD_OWNER)
-    fee_label = "0 so'm (🎁 1-savdo bepul!)" if fee == 0 else f"{fmt(fee)} so'm (10%)"
+    fee_label = f"{fmt(fee)} so'm ({comm_pct}%)"
 
     payment_card = (
         f"💳 <b>KAFOLATLI TO'LOV HISOBI OCHILDI! (#{deal_id})</b>\n"
@@ -1402,13 +1414,13 @@ async def process_deal_amount(msg: Message, state: FSMContext):
         f"📦 <b>Mahsulot:</b> <b>{esc_html(title)}</b>\n"
         f"👤 <b>Sotuvchi:</b> @{esc_html(seller_tag)}\n"
         f"💵 <b>Kelishilgan summa:</b> <b>{fmt(amount)} so'm</b>\n"
-        f"💼 <b>Komissiya:</b> <b>{fee_label}</b>\n"
+        f"💼 <b>Komissiya ({comm_pct}%):</b> <b>{fee_label}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💳 <b>TO'LOV KARTASI:</b>\n"
         f"👉 <code>{card_num}</code>\n"
         f"<i>(Karta ustiga bosing — avtomatik nusxalanadi!)</i>\n"
         f"👤 <b>Qabul qiluvchi:</b> <b>{esc_html(card_own)}</b>\n\n"
-        f"💰 <b>O'TKAZILADIGAN ANIQ SUMMA:</b>\n"
+        f"💰 <b>O'TKAZILADIGAN ANIQ SUMMA (Komissiya bilan):</b>\n"
         f"👉 <code>{fmt(exact_amount)} so'm</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"⚠️ <b>DIQQAT! JUDA MUHIM:</b>\n"
@@ -1510,7 +1522,11 @@ async def i_paid_callback_step(call: CallbackQuery, state: FSMContext):
                 f"📌 <b>Iltimos tekshiring:</b>\n"
                 f"1️⃣ Ko'rsatilgan kartaga aynan <b>{fmt(deal['total_to_pay'])} so'm</b> o'tkazildimi?\n"
                 f"2️⃣ Mablag' bankingizdan (Click / Payme) to'liq yechildimi?\n\n"
-                f"<i>💡 Agar to'lovni hozirgina o'tkazgan bo'lsangiz, bank SMS xabari kelishi uchun yana 10-15 soniya ketishi mumkin. Birozdan so'ng qayta «✅ To'lov qildim» tugmasini bosing yoki fon rejimida o'zi tasdiqlanishini kuting.</i>"
+                f"<i>💡 Agar to'lovni hozirgina o'tkazgan bo'lsangiz, bank SMS xabari kelishi uchun yana biroz vaqt ketishi mumkin. Qaytadan tekshirish uchun quyidagi tugmani bosing:</i>",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🔄 Qayta tekshirish (20 soniya)", callback_data=f"i_paid:{d_id}")],
+                    [InlineKeyboardButton(text="❌ Bekor qilish", callback_data=f"cancel_deal:{d_id}")]
+                ])
             )
     finally:
         _active_checking_deals.discard(d_id)
@@ -2185,20 +2201,36 @@ async def adm_proc_ch_id(msg: Message, state: FSMContext):
         await msg.answer("Bekor qilindi.", reply_markup=main_menu_keyboard(msg.from_user.id))
         return
 
-    cid = msg.text.strip()
+    raw = msg.text.strip()
+    clean = re.sub(r"^(https?:\/\/)?(www\.)?t\.me\/", "", raw, flags=re.IGNORECASE).strip()
+    clean = clean.split("/")[0].split("?")[0].strip()
+
+    if clean.lstrip("-").isdigit():
+        target_chat = int(clean)
+    elif clean.startswith("@"):
+        target_chat = clean
+    else:
+        target_chat = f"@{clean}"
+
     ch_title = ""
     ch_link = ""
+    cid = str(target_chat)
 
     try:
-        chat = await bot.get_chat(cid)
-        ch_title = chat.title or cid
+        chat = await bot.get_chat(target_chat)
+        ch_title = chat.title or str(target_chat)
         if chat.username:
             ch_link = f"https://t.me/{chat.username}"
         elif chat.invite_link:
             ch_link = chat.invite_link
+        else:
+            try:
+                ch_link = await bot.export_chat_invite_link(chat.id)
+            except Exception:
+                ch_link = f"https://t.me/{clean.lstrip('@')}"
         cid = str(chat.id)
 
-        member = await bot.get_chat_member(chat_id=cid, user_id=bot.id)
+        member = await bot.get_chat_member(chat_id=chat.id, user_id=bot.id)
         if member.status not in ("administrator", "creator"):
             await msg.answer(
                 "⚠️ <b>DIQQAT: Bot ushbu kanalda admin emas!</b>\n"
@@ -2206,26 +2238,27 @@ async def adm_proc_ch_id(msg: Message, state: FSMContext):
             )
             return
     except Exception as e:
-        logger.warning(f"Kanalni aniqlashda xato: {e}")
-
-    await state.update_data(ch_id=cid, ch_title=ch_title, ch_link=ch_link)
-
-    if ch_title and ch_link:
-        db.q("INSERT INTO mandatory_channels (channel_id, channel_title, invite_link) VALUES (?, ?, ?)",
-             (cid, ch_title, ch_link), commit=True)
-        await state.clear()
+        logger.warning(f"Kanalni aniqlashda xato ({target_chat}): {e}")
         await msg.answer(
-            f"✅ <b>Kanal muvaffaqiyatli qo'shildi!</b>\n\n"
-            f"📢 Nomi: <b>{esc_html(ch_title)}</b>\n"
-            f"🆔 ID: <code>{cid}</code>\n"
-            f"🔗 Link: {ch_link}\n\n"
-            f"<i>Endi ushbu kanalga obuna bo'lmagan foydalanuvchilar botdan foydalana olmaydi.</i>",
-            reply_markup=main_menu_keyboard(msg.from_user.id)
+            f"⚠️ <b>Kanal topilmadi yoki bot admin emas!</b>\n"
+            f"Xatolik: <i>{esc_html(str(e))}</i>\n\n"
+            f"1. Botni avval kanalingizga <b>ADMIN</b> qilib qo'shing.\n"
+            f"2. Kanalning to'g'ri @username'ini (masalan: <code>@mening_kanalim</code>) yuboring."
         )
         return
 
-    await state.set_state(AdminFSM.add_channel_title)
-    await msg.answer(f"Kanal ID: <code>{cid}</code> qabul qilindi.\nKanal nomini kiriting:")
+    await state.update_data(ch_id=cid, ch_title=ch_title, ch_link=ch_link)
+    db.q("INSERT INTO mandatory_channels (channel_id, channel_title, invite_link) VALUES (?, ?, ?)",
+         (cid, ch_title, ch_link), commit=True)
+    await state.clear()
+    await msg.answer(
+        f"✅ <b>Kanal muvaffaqiyatli qo'shildi!</b>\n\n"
+        f"📢 Nomi: <b>{esc_html(ch_title)}</b>\n"
+        f"🆔 ID: <code>{cid}</code>\n"
+        f"🔗 Link: {ch_link}\n\n"
+        f"<i>Endi ushbu kanalga obuna bo'lmagan foydalanuvchilar botdan foydalana olmaydi.</i>",
+        reply_markup=main_menu_keyboard(msg.from_user.id)
+    )
 
 @router.message(AdminFSM.add_channel_title)
 async def adm_proc_ch_title(msg: Message, state: FSMContext):

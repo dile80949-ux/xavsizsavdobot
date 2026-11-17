@@ -126,14 +126,14 @@ def validate_user_input(field_type: str, raw_value: str, extra: Optional[Dict[st
                 "⚠️ <b>Kiritilgan summa noto'g'ri!</b>\n\n"
                 "Iltimos, to'lov summasini faqat butun raqamlarda kiriting (harflarsiz).\n"
                 "📌 <b>Namunalar:</b> <code>15000</code> yoki <code>50000</code>\n"
-                "(Minimal summa: <b>1 000 so'm</b>, maksimal: <b>100 000 so'm</b>)\n\n"
+                "(Minimal summa: <b>1 000 so'm</b>, maksimal: <b>5 000 000 so'm</b>)\n\n"
                 "👉 <i>Iltimos, summani to'g'rilab qaytadan yuboring:</i>",
                 None
             )
 
         amount = int(raw_s)
         min_limit = extra.get("min_limit", 1000)
-        max_limit = extra.get("max_limit", 100000)
+        max_limit = extra.get("max_limit", 5000000000)
 
         if amount < min_limit or amount > max_limit:
             return (
