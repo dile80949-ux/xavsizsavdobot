@@ -10,6 +10,7 @@ import random
 import string
 import logging
 import asyncio
+import time
 import requests
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any, Tuple
@@ -1132,7 +1133,7 @@ async def process_comp_reason(msg: Message, state: FSMContext):
                 f"🚨 <b>YANGI ARIZA: #{comp_id}</b>\n"
                 f"Kimdan: @{esc_html(msg.from_user.username or '')} (ID: <code>{msg.from_user.id}</code>)\n"
                 f"Kimga: @{esc_html(seller_tag)} (ID: <code>{accused_id or 'nomalum'}</code>)\n"
-                f"Sabab: <i>{esc_html(reason)}</i>"
+                f"Sabab: <i>{esc_html(clean_reason)}</i>"
             )
         except Exception:
             pass
@@ -2464,7 +2465,7 @@ async def adm_proc_ticket_reply(msg: Message, state: FSMContext):
 
     ticket = db.q("SELECT * FROM ai_tickets WHERE id=?", (t_id,), one=True)
     if ticket:
-        db.q("UPDATE ai_tickets SET status='answered', admin_response=? WHERE id=?", (reply_text, t_id), commit=True)
+        db.q("UPDATE ai_tickets SET status='answered', admin_reply=? WHERE id=?", (reply_text, t_id), commit=True)
         try:
             await bot.send_message(
                 ticket["user_id"],
