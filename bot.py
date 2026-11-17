@@ -184,12 +184,14 @@ class AdminFSM(StatesGroup):
     reply_ticket_text = State()
 
 # ============================ 4. TOLOVAPI.UZ INTEGRATSIYASI ============================
-async def tolovapi_request(path: str, params: dict, method: str = "POST") -> dict:
+_active_checking_deals = set()
+
+async def tolovapi_request(path: str, params: dict, method: str = "POST", timeout_sec: int = 10) -> dict:
     """TolovAPI.uz rasmiy API mijoz funksiyasi (X-Shop-Key sarlavhasi bilan)."""
     url = f"{TOLOV_API_URL.rstrip('/')}/{path.lstrip('/')}"
     headers = {"X-Shop-Key": SHOP_KEY}
     full_params = {"shop_id": int(SHOP_ID) if str(SHOP_ID).isdigit() else SHOP_ID, **params}
-    timeout = ClientTimeout(total=15)
+    timeout = ClientTimeout(total=timeout_sec)
     try:
         async with ClientSession(timeout=timeout) as session:
             if method.upper() == "GET":
@@ -205,13 +207,13 @@ async def tolovapi_request(path: str, params: dict, method: str = "POST") -> dic
 async def create_payment_async(amount: int, order_id: Optional[str] = None, user_id: Optional[int] = None) -> Optional[dict]:
     """TolovAPI orqali yangi to'lov hisobini ochish."""
     oid = str(order_id) if order_id else f"ORD{random.randint(100000, 999999)}"
-    res = await tolovapi_request("payment/create", {"amount": int(amount), "order_id": oid})
+    res = await tolovapi_request("payment/create", {"amount": int(amount), "order_id": oid}, timeout_sec=12)
 
     if res.get("error_code") == "amount_busy" or res.get("error") == "amount_busy":
         suggested = res.get("suggested_amount")
         if suggested and int(suggested) != amount:
             logger.info(f"TolovAPI: {amount} summa band, taklif: {suggested} bilan qayta ochilmoqda...")
-            res = await tolovapi_request("payment/create", {"amount": int(suggested), "order_id": oid})
+            res = await tolovapi_request("payment/create", {"amount": int(suggested), "order_id": oid}, timeout_sec=12)
 
     if res.get("ok") or res.get("payment_id"):
         return {
@@ -231,12 +233,13 @@ async def check_payment_status_async(payment_id: str) -> Optional[dict]:
     """TolovAPI orqali to'lov holatini tekshirish (GET orqali)."""
     if not payment_id:
         return None
-    res = await tolovapi_request("payment/status", {"payment_id": str(payment_id)}, method="GET")
+    res = await tolovapi_request("payment/status", {"payment_id": str(payment_id)}, method="GET", timeout_sec=5)
     st = str(res.get("status", "")).lower()
     return {
-        "ok": res.get("ok", False) or bool(st),
-        "paid": st == "paid",
+        "ok": res.get("ok", False) or (st in ("paid", "pending", "success")),
+        "paid": (st in ("paid", "success")),
         "status": st,
+        "amount": res.get("amount"),
         "raw": res
     }
 
@@ -322,9 +325,109 @@ async def penalize_referral_if_left(user_id: int):
         pass
 
 # ============================ 6. ASINXRON FON TAYMERLARI ============================
-async def deal_5min_timer(deal_id: str):
-    """5 daqiqalik asinxron to'lov taymeri."""
-    await asyncio.sleep(300)
+async def activate_paid_deal(deal_id: str, edit_call: Optional[CallbackQuery] = None, state: Optional[FSMContext] = None) -> bool:
+    deal = db.get_deal(deal_id)
+    if not deal or deal["status"] != "waiting_payment":
+        return False
+
+    now_s = datetime.now(TZ).isoformat()
+    db.q("UPDATE deals SET status='in_trade', updated_at=? WHERE deal_id=?", (now_s, deal_id), commit=True)
+
+    buyer_id = deal["buyer_id"]
+    seller_tag = deal["seller_username"]
+    title = deal["title"]
+    d_id = deal["deal_id"]
+    total = deal["total_to_pay"]
+
+    if deal["mode"] == "group":
+        if state:
+            await state.set_state(CreateDealFSM.group_link)
+            await state.update_data(active_deal_id=d_id)
+        else:
+            try:
+                buyer_state = dp.fsm.get_context(bot=bot, chat_id=buyer_id, user_id=buyer_id)
+                await buyer_state.set_state(CreateDealFSM.group_link)
+                await buyer_state.update_data(active_deal_id=d_id)
+            except Exception:
+                pass
+
+        text = (
+            f"✅ <b>TO'LOV MUVAFFAQIYATLI QABUL QILINDI! (#{d_id})</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"💵 <b>To'langan summa:</b> <b>{fmt(total)} so'm</b> (Muzlatildi 🔒)\n"
+            f"📦 <b>Mahsulot:</b> <b>{esc_html(title)}</b>\n\n"
+            f"Endi meni guruhingizga qo'shishingiz va menga <b>ADMIN HUQUQINI</b> berishingiz kerak.\n\n"
+            f"👉 <b>Menga guruhingizning taklif havolasini (linkini) yuboring:</b>\n"
+            f"<i>(Masalan: https://t.me/+xxxxxx yoki https://t.me/guruh_nomi)</i>"
+        )
+        if edit_call:
+            try:
+                await edit_call.message.edit_text(text)
+            except Exception:
+                await bot.send_message(buyer_id, text)
+        else:
+            await bot.send_message(buyer_id, text)
+    else:
+        bot_info = await bot.get_me()
+        invite_link = f"https://t.me/{bot_info.username}?start=deal_{d_id}"
+        text = (
+            f"✅ <b>TO'LOV MUVAFFAQIYATLI QABUL QILINDI VA MUZLATILDI! (#{d_id})</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"💵 <b>To'langan summa:</b> <b>{fmt(total)} so'm</b> (Kafil hisobida xavfsiz muzlatildi 🔒)\n"
+            f"📦 <b>Mahsulot:</b> <b>{esc_html(title)}</b>\n\n"
+            f"Endi sotuvchi @{esc_html(seller_tag)} ga quyidagi ulanish havolasini yuboring:\n"
+            f"👉 <code>{invite_link}</code>\n"
+            f"<i>(Havola ustiga bosing — avtomatik nusxalanadi!)</i>\n\n"
+            f"Sotuvchi havola orqali botga kirishi bilan bot ichidagi xavfsiz chat ishga tushadi."
+        )
+        if edit_call:
+            try:
+                await edit_call.message.edit_text(text)
+            except Exception:
+                await bot.send_message(buyer_id, text)
+        else:
+            await bot.send_message(buyer_id, text)
+
+    # Sotuvchiga ham xabarnoma berish (agar uning IDsi ma'lum bo'lsa)
+    if deal.get("seller_id"):
+        try:
+            await bot.send_message(
+                deal["seller_id"],
+                f"🎉 <b>Xaridor to'lovni amalga oshirdi! (#{d_id})</b>\n"
+                f"Pul kafil hisobida xavfsiz muzlatildi 🔒.\n"
+                f"Tovar/xizmatni topshirishga tayyor turing."
+            )
+        except Exception:
+            pass
+    return True
+
+async def deal_auto_payment_watcher(deal_id: str):
+    """
+    To'lov hisobi ochilgach, 5 daqiqa (300 soniya) davomida har 3 soniyada
+    TolovAPI.uz dan to'lov tushganini avtomatik tekshiruvchi tezyurar fon taymeri.
+    Pul kartaga tushishi bilanoq xaridor tugmani bosishini kutmasdan darhol savdoni faollashtiradi!
+    """
+    start_time = time.time()
+    while time.time() - start_time < 300:
+        await asyncio.sleep(3)
+        deal = db.get_deal(deal_id)
+        if not deal or deal["status"] != "waiting_payment":
+            return  # Bitim allaqachon to'langan yoki bekor qilingan
+
+        payment_id = deal.get("payment_id")
+        if payment_id:
+            try:
+                chk = await check_payment_status_async(payment_id)
+                if chk and chk.get("paid"):
+                    paid_amt = int(chk.get("amount") or chk.get("raw", {}).get("amount", 0) or deal["total_to_pay"])
+                    if paid_amt >= int(deal["total_to_pay"]):
+                        logger.info(f"Avtomatik tezkor to'lov aniqlandi: #{deal_id}, Summa: {paid_amt}")
+                        await activate_paid_deal(deal_id)
+                        return
+            except Exception as e:
+                logger.error(f"Watcher tekshiruv xatosi (#{deal_id}): {e}")
+
+    # Agar 5 daqiqa ichida to'lov qilinmasa - bekor qilinadi
     deal = db.get_deal(deal_id)
     if deal and deal["status"] == "waiting_payment":
         now_s = datetime.now(TZ).isoformat()
@@ -335,11 +438,13 @@ async def deal_5min_timer(deal_id: str):
             await bot.send_message(
                 deal["buyer_id"],
                 f"⏱ <b>5 DAQIQA VAQT TUGADI! (#{deal_id})</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"Belgilangan 5 daqiqa ichida to'lov qilinmagani sababli bitim avtomatik <b>bekor qilindi</b>."
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"Belgilangan 5 daqiqa ichida to'lov qilinmagani sababli to'lov hisobi avtomatik <b>bekor qilindi</b>."
             )
         except Exception:
             pass
+
+deal_5min_timer = deal_auto_payment_watcher
 
 async def complaints_auto_expire_loop():
     """5 kunda arizaga javob bermagan sotuvchini avtomatik qora ro'yxatga kirituvchi loop."""
@@ -1253,11 +1358,23 @@ async def process_deal_amount(msg: Message, state: FSMContext):
 
     deal_id = generate_deal_id()
     pay_res = await create_payment_async(total_to_pay, order_id=deal_id, user_id=uid)
+    if not pay_res or not pay_res.get("payment_id"):
+        await asyncio.sleep(1)
+        pay_res = await create_payment_async(total_to_pay, order_id=deal_id, user_id=uid)
+
     exact_amount = total_to_pay
     payment_id = None
-    if pay_res and pay_res.get("ok"):
+    if pay_res and pay_res.get("payment_id"):
         payment_id = pay_res.get("payment_id")
         exact_amount = int(pay_res.get("amount", total_to_pay))
+    else:
+        await msg.answer(
+            "⚠️ <b>To'lov tizimida vaqtinchalik uzilish yuz berdi.</b>\n"
+            "Iltimos, 1 daqiqadan so'ng qayta urinib ko'ring yoki administrator bilan bog'laning.",
+            reply_markup=main_menu_keyboard(uid)
+        )
+        await state.clear()
+        return
 
     db.create_deal(
         deal_id=deal_id,
@@ -1273,7 +1390,7 @@ async def process_deal_amount(msg: Message, state: FSMContext):
     )
 
     await state.clear()
-    asyncio.create_task(deal_5min_timer(deal_id))
+    asyncio.create_task(deal_auto_payment_watcher(deal_id))
 
     card_num = format_card((pay_res and pay_res.get("card_number")) or db.get_setting("card_number", DEFAULT_CARD_NUMBER))
     card_own = db.get_setting("card_owner", DEFAULT_CARD_OWNER)
@@ -1281,23 +1398,23 @@ async def process_deal_amount(msg: Message, state: FSMContext):
 
     payment_card = (
         f"💳 <b>KAFOLATLI TO'LOV HISOBI OCHILDI! (#{deal_id})</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📦 <b>Mahsulot:</b> <b>{esc_html(title)}</b>\n"
         f"👤 <b>Sotuvchi:</b> @{esc_html(seller_tag)}\n"
         f"💵 <b>Kelishilgan summa:</b> <b>{fmt(amount)} so'm</b>\n"
         f"💼 <b>Komissiya:</b> <b>{fee_label}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💳 <b>TO'LOV KARTASI:</b>\n"
         f"👉 <code>{card_num}</code>\n"
-        f"<i>(Karta ustiga bosing, avtomatik nusxalanadi!)</i>\n"
+        f"<i>(Karta ustiga bosing — avtomatik nusxalanadi!)</i>\n"
         f"👤 <b>Qabul qiluvchi:</b> <b>{esc_html(card_own)}</b>\n\n"
         f"💰 <b>O'TKAZILADIGAN ANIQ SUMMA:</b>\n"
-        f"👉 <b>{fmt(exact_amount)} so'm</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"⚠️ <b>DIQQAT! JUDA MUHIM OGOHLANTIRISH:</b>\n"
-        f"<b>Ko'rsatilgan summadan 1 so'm ham kam yoki ortiq to'lamang! Aynan {fmt(exact_amount)} so'mni aniq o'tkazing, aks holda to'lov tizim tomonidan avtomatik tasdiqlanmay qolishi mumkin.</b>\n\n"
-        f"⏱ <b>Siz 5 minut ichida to'lov qilmasangiz to'lov avtomatik bekor qilinadi.</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━"
+        f"👉 <code>{fmt(exact_amount)} so'm</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⚠️ <b>DIQQAT! JUDA MUHIM:</b>\n"
+        f"Aynan <b>{fmt(exact_amount)} so'm</b>ni aniq o'tkazing! Kam yoki ortiq to'lasangiz, tizim to'lovni avtomatik tasdiqlay olmaydi.\n\n"
+        f"⚡️ <i>To'lov o'tkazilishi bilan bot avtomatik aniqlaydi. Agar o'tmasa, quyidagi «✅ To'lov qildim» tugmasini bosing (bot 20 soniya davomida faol tekshiradi).</i>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
     kb = []
     if pay_res and pay_res.get("payment_url"):
@@ -1311,47 +1428,92 @@ async def process_deal_amount(msg: Message, state: FSMContext):
 async def i_paid_callback_step(call: CallbackQuery, state: FSMContext):
     d_id = call.data.split(":")[1]
     deal = db.get_deal(d_id)
-    if not deal or deal["status"] != "waiting_payment":
-        await call.answer("⚠️ Bitim holati o'zgargan yoki muddati tugagan.", show_alert=True)
+    if not deal:
+        await call.answer("⚠️ Bitim topilmadi.", show_alert=True)
         return
 
-    payment_id = deal["payment_id"]
-    is_paid = False
-    if payment_id:
+    # Agar allaqachon to'langan bo'lsa
+    if deal["status"] in ("in_trade", "goods_delivered", "completed", "buyer_statement", "seller_statement", "buyer_confirmed"):
+        await call.answer("✅ Ushbu bitim uchun to'lov allaqachon qabul qilingan!", show_alert=True)
+        return
+
+    if deal["status"] != "waiting_payment":
+        await call.answer("⚠️ Bitim muddati tugagan yoki bekor qilingan.", show_alert=True)
+        return
+
+    payment_id = deal.get("payment_id")
+    if not payment_id:
+        await call.answer("⚠️ To'lov hisob raqami (payment_id) topilmadi.", show_alert=True)
+        return
+
+    if d_id in _active_checking_deals:
+        await call.answer("⏳ To'lov tekshirilmoqda, 20 soniya kuting...", show_alert=True)
+        return
+
+    _active_checking_deals.add(d_id)
+    try:
+        # 1. Tezkor birinchi tekshiruv (0-soniya)
         chk = await check_payment_status_async(payment_id)
         if chk and chk.get("paid"):
-            is_paid = True
+            paid_amt = int(chk.get("amount") or chk.get("raw", {}).get("amount", 0) or deal["total_to_pay"])
+            if paid_amt >= int(deal["total_to_pay"]):
+                await call.answer("✅ To'lov muvaffaqiyatli qabul qilindi!", show_alert=True)
+                await activate_paid_deal(d_id, edit_call=call, state=state)
+                return
 
-    if not is_paid:
-        await call.answer("⏳ To'lov hali kelib tushmadi!\n\nIltimos, ko'rsatilgan aniq summani kartaga o'tkazib so'ng qayta tekshiring.", show_alert=True)
-        return
+        # 2. Agar hali tushmagan bo'lsa: 20 soniyalik monitoring
+        await call.answer("🔍 To'lov tekshirilmoqda (20 soniya davomida)...", show_alert=False)
 
-    await call.answer("✅ To'lov muvaffaqiyatli qabul qilindi!", show_alert=True)
-    now_s = datetime.now(TZ).isoformat()
-    db.q("UPDATE deals SET status='in_trade', updated_at=? WHERE deal_id=?", (now_s, d_id), commit=True)
-
-    if deal["mode"] == "group":
-        await state.set_state(CreateDealFSM.group_link)
-        await state.update_data(active_deal_id=d_id)
-        await call.message.edit_text(
-            f"✅ <b>TO'LOV AMALGA OSHDI! (#{d_id})</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Endi meni guruhingizga qo'shishingiz va menga <b>ADMIN HUQUQINI</b> berishingiz kerak.\n\n"
-            f"👉 <b>Menga guruhingizning taklif havolasini (linkini) yuboring:</b>\n"
-            f"<i>(Masalan: https://t.me/+xxxxxx yoki https://t.me/guruh_nomi)</i>"
+        status_msg = await call.message.answer(
+            f"⏳ <b>TO'LOV TIZIMI TEKSHIRILMOQDA... (#{d_id})</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Kartangizga <b>{fmt(deal['total_to_pay'])} so'm</b> tushgani qidirilmoqda...\n"
+            f"<i>Bank va SMS xabarlari yetib kelishi uchun 20 soniya davomida har 2 soniyada uzluksiz tekshiriladi. Iltimos, kuting...</i>"
         )
-    else:
-        bot_info = await bot.get_me()
-        invite_link = f"https://t.me/{bot_info.username}?start=deal_{d_id}"
-        await call.message.edit_text(
-            f"✅ <b>TO'LOV AMALGA OSHDI VA MUZLATILDI! (#{d_id})</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Xaridor to'lagan <b>{fmt(deal['total_to_pay'])} so'm</b> pul kafil hisobida xavfsiz muzlatildi.\n\n"
-            f"Endi sotuvchi @{esc_html(deal['seller_username'])} ga quyidagi ulanish havolasini yuboring:\n"
-            f"👉 <code>{invite_link}</code>\n"
-            f"<i>(Ustiga bosing, avtomatik nusxalanadi!)</i>\n\n"
-            f"Sotuvchi ushbu havola orqali botga kirishi bilan bot ichidagi xavfsiz chat ishga tushadi."
-        )
+
+        start_time = time.time()
+        is_success = False
+
+        while (time.time() - start_time) < 20:
+            await asyncio.sleep(2)
+            curr = db.get_deal(d_id)
+            if curr and curr["status"] != "waiting_payment":
+                is_success = True
+                break
+
+            chk = await check_payment_status_async(payment_id)
+            if chk and chk.get("paid"):
+                paid_amt = int(chk.get("amount") or chk.get("raw", {}).get("amount", 0) or deal["total_to_pay"])
+                if paid_amt >= int(deal["total_to_pay"]):
+                    is_success = True
+                    break
+
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+
+        if is_success:
+            await activate_paid_deal(d_id, edit_call=call, state=state)
+            try:
+                await call.message.answer(
+                    f"🎉 <b>TO'LOVINGIZ QABUL QILINDI! (#{d_id})</b>\n\n"
+                    f"To'lov tizimi muvaffaqiyatli tasdiqladi. Mablag' kafil hisobida xavfsiz muzlatildi 🔒."
+                )
+            except Exception:
+                pass
+        else:
+            await call.message.answer(
+                f"❌ <b>20 SONIYA DAVOMIDA TO'LOV ANIQLANMADI! (#{d_id})</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"TolovAPI tizimida ko'rsatilgan kartaga to'lovingiz hali kelib tushmadi.\n\n"
+                f"📌 <b>Iltimos tekshiring:</b>\n"
+                f"1️⃣ Ko'rsatilgan kartaga aynan <b>{fmt(deal['total_to_pay'])} so'm</b> o'tkazildimi?\n"
+                f"2️⃣ Mablag' bankingizdan (Click / Payme) to'liq yechildimi?\n\n"
+                f"<i>💡 Agar to'lovni hozirgina o'tkazgan bo'lsangiz, bank SMS xabari kelishi uchun yana 10-15 soniya ketishi mumkin. Birozdan so'ng qayta «✅ To'lov qildim» tugmasini bosing yoki fon rejimida o'zi tasdiqlanishini kuting.</i>"
+            )
+    finally:
+        _active_checking_deals.discard(d_id)
 
 @router.message(CreateDealFSM.group_link)
 async def process_deal_group_link(msg: Message, state: FSMContext):
