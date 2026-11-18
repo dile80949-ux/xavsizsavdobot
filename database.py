@@ -26,8 +26,9 @@ def q(query: str, args: tuple = (), one: bool = False, commit: bool = False) -> 
             conn.commit()
             return cur.lastrowid
         if one:
-            return cur.fetchone()
-        return cur.fetchall()
+            row = cur.fetchone()
+            return dict(row) if row else None
+        return [dict(r) for r in cur.fetchall()]
     finally:
         conn.close()
 
@@ -237,7 +238,7 @@ def ensure_user(user_id: int, username: Optional[str], full_name: Optional[str],
     else:
         q("UPDATE users SET username=?, full_name=? WHERE user_id=?", (clean_un, full_name or "", user_id), commit=True)
 
-def get_user(user_id: int) -> Optional[sqlite3.Row]:
+def get_user(user_id: int) -> Optional[dict]:
     return q("SELECT * FROM users WHERE user_id=?", (user_id,), one=True)
 
 # ==================== QORA RO'YXAT / FIRIBGARLAR ====================
@@ -270,7 +271,7 @@ def remove_from_blacklist(blacklist_id: int):
         q("UPDATE users SET is_banned=0 WHERE user_id=?", (row["user_id"],), commit=True)
     q("DELETE FROM blacklist WHERE id=?", (blacklist_id,), commit=True)
 
-def get_all_blacklisted(limit: int = 20) -> List[sqlite3.Row]:
+def get_all_blacklisted(limit: int = 20) -> List[dict]:
     return q("SELECT * FROM blacklist ORDER BY id DESC LIMIT ?", (limit,))
 
 # ==================== SAVDOLAR (DEALS) ====================
@@ -283,10 +284,10 @@ def create_deal(deal_id: str, buyer_id: int, buyer_username: str, seller_usernam
     """, (deal_id, buyer_id, buyer_username, seller_username, title, amount, fee, total_to_pay, mode, payment_id, now_s, now_s, now_s), commit=True)
     return deal_id
 
-def get_deal(deal_id: str) -> Optional[sqlite3.Row]:
+def get_deal(deal_id: str) -> Optional[dict]:
     return q("SELECT * FROM deals WHERE deal_id=?", (deal_id,), one=True)
 
-def get_active_deal_for_user(user_id: int) -> Optional[sqlite3.Row]:
+def get_active_deal_for_user(user_id: int) -> Optional[dict]:
     return q("SELECT * FROM deals WHERE buyer_id=? AND status IN ('created', 'waiting_payment', 'in_trade', 'goods_delivered', 'buyer_statement', 'seller_statement', 'buyer_confirmed', 'dispute') ORDER BY updated_at DESC LIMIT 1", (user_id,), one=True)
 
 def log_deal_message(deal_id: str, sender_id: int, sender_tag: str, role: str, text: str):
@@ -294,7 +295,7 @@ def log_deal_message(deal_id: str, sender_id: int, sender_tag: str, role: str, t
     q("INSERT INTO deal_messages (deal_id, sender_id, sender_tag, role, message_text, created_at) VALUES (?, ?, ?, ?, ?, ?)",
       (deal_id, sender_id, sender_tag, role, text, now_s), commit=True)
 
-def get_deal_messages(deal_id: str, limit: int = 50) -> List[sqlite3.Row]:
+def get_deal_messages(deal_id: str, limit: int = 50) -> List[dict]:
     return q("SELECT * FROM deal_messages WHERE deal_id=? ORDER BY id ASC LIMIT ?", (deal_id, limit))
 
 # ==================== PUL YECHISH (WITHDRAWALS) ====================
@@ -305,7 +306,7 @@ def create_withdrawal(user_id: int, amount: int, card_number: str, card_owner: s
     VALUES (?, ?, ?, ?, 'pending', ?)
     """, (user_id, amount, card_number, card_owner, now_s), commit=True)
 
-def get_pending_withdrawals(limit: int = 10) -> List[sqlite3.Row]:
+def get_pending_withdrawals(limit: int = 10) -> List[dict]:
     return q("SELECT * FROM withdrawals WHERE status='pending' ORDER BY created_at ASC LIMIT ?", (limit,))
 
 def complete_withdrawal(withdrawal_id: int) -> bool:
@@ -325,7 +326,7 @@ def create_complaint(deal_id: str = "", complainant_id: int = 0, complainant_use
     VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
     """, (deal_id or "", complainant_id, complainant_username or "", accused_id, accused_username or "", reason, deadline_s, now_s), commit=True)
 
-def get_user_complaints(user_id: int) -> List[sqlite3.Row]:
+def get_user_complaints(user_id: int) -> List[dict]:
     return q("SELECT * FROM complaints WHERE complainant_id=? ORDER BY id DESC", (user_id,))
 
 def withdraw_complaint(complaint_id: int) -> bool:
