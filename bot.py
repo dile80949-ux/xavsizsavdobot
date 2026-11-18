@@ -84,12 +84,9 @@ class MandatorySubMiddleware(BaseMiddleware):
 
         uid = user.id
 
-        # Admin panel boshqaruvi va kanallarni sozlash uchun adminga ruxsat berish
+        # Admin panel boshqaruvi va test uchun adminga to'liq ruxsat berish
         if is_admin(uid):
-            if isinstance(event, Message) and event.text and (event.text.startswith("/admin") or "Admin" in event.text or "👑" in event.text):
-                return await handler(event, data)
-            if isinstance(event, CallbackQuery) and event.data and event.data.startswith("adm_"):
-                return await handler(event, data)
+            return await handler(event, data)
 
         # check_sub callbackiga ruxsat berish
         if isinstance(event, CallbackQuery) and event.data == "check_sub":
@@ -266,8 +263,14 @@ async def check_user_subscribed(user_id: int) -> Tuple[bool, List[dict]]:
     unsubscribed = []
     for ch in channels:
         try:
-            raw_cid = ch["channel_id"]
-            cid = int(raw_cid) if str(raw_cid).lstrip("-").isdigit() else raw_cid
+            raw_cid = str(ch["channel_id"]).strip()
+            if "t.me/" in raw_cid:
+                clean_un = raw_cid.split("t.me/")[-1].split("/")[0].split("?")[0].lstrip("@")
+                cid = f"@{clean_un}"
+            elif raw_cid.lstrip("-").isdigit():
+                cid = int(raw_cid)
+            else:
+                cid = raw_cid if raw_cid.startswith("@") else f"@{raw_cid}"
             member = await bot.get_chat_member(chat_id=cid, user_id=user_id)
             if member.status in ("creator", "administrator", "member", "restricted"):
                 continue
@@ -1623,6 +1626,75 @@ async def process_deal_group_link(msg: Message, state: FSMContext):
     )
 
 # ============================ 12. GURUHDA SAVDO VA AI QOROVUL ============================
+def parse_seller_card_submission(text: str, sender_id: int):
+    """
+    Sotuvchi to'ldirgan karta shablonini tahlil qilish va tekshirish.
+    1. Karta raqam: 8600123456789012
+    2. Karta raqam egasi: Aliyev Vali
+    3. ID raqamingiz: 123456789
+    """
+    card_match = re.search(r'\b(?:\d[ \-_]*){16}\b', text)
+    if not card_match:
+        raw_digits = re.sub(r'\D', '', text)
+        if len(raw_digits) >= 16:
+            card_num = raw_digits[:16]
+        else:
+            return None, None, None, "❌ <b>16 xonali plastik karta raqami topilmadi yoki to'liq emas!</b>\nIltimos, kartangizni tekshirib qaytadan kiriting."
+    else:
+        card_num = re.sub(r'\D', '', card_match.group(0))
+
+    if len(card_num) != 16:
+        return None, None, None, "❌ <b>Plastik karta raqami aynan 16 ta raqamdan iborat bo'lishi kerak!</b>"
+
+    text_no_card = text.replace(card_match.group(0) if card_match else card_num, "")
+
+    id_match = re.search(r'(?i)(?:id\s*(?:raqam(?:ingiz)?)?)\s*[:\-]?\s*(\d{5,15})', text_no_card)
+    id_val = None
+    if id_match:
+        id_val = int(id_match.group(1))
+    else:
+        standalone_ids = re.findall(r'\b\d{5,12}\b', text_no_card)
+        if standalone_ids:
+            id_val = int(standalone_ids[0])
+
+    if not id_val:
+        return None, None, None, "❌ <b>Telegram ID raqamingiz kiritilmadi!</b>\nIltimos, o'z Telegram ID raqamingizni kiriting."
+
+    if id_val != sender_id:
+        return None, None, None, (
+            f"❌ <b>ID raqami mos kelmadi!</b>\n"
+            f"Siz kiritgan ID (<code>{id_val}</code>) sizning haqiqiy Telegram ID raqamingizga (<code>{sender_id}</code>) to'g'ri kelmadi.\n"
+            f"Iltimos, aynan o'zingizning haqiqiy Telegram ID raqamingizni yozing!"
+        )
+
+    # 3. Karta egasi
+    owner_match = re.search(r'(?i)(?:karta\s*(?:raqam\s*)?egasi|egasi)\s*[:\-]?\s*([^\n\r]+)', text_no_card)
+    owner_name = None
+    if owner_match:
+        raw_name = owner_match.group(1).strip()
+        clean_name = re.sub(r'[^a-zA-Zа-яА-ЯёЁoʻo‘gʻg‘shch\s\.\']', '', raw_name).strip()
+        if len(clean_name) >= 3:
+            owner_name = clean_name
+        else:
+            return None, None, None, "❌ <b>Karta egasining Ism va Familiyasi to'liq kiritilmadi!</b>\nIltimos, karta egasining Ism-Familiyasini yozing (Masalan: ALIYEV VALI)."
+
+    if not owner_name:
+        lines = [l.strip() for l in text_no_card.splitlines() if l.strip()]
+        for line in lines:
+            if re.search(r'(?i)(?:id|raqamingiz)', line):
+                continue
+            clean_l = re.sub(r'^\d+[\.\)]\s*', '', line).strip()
+            clean_l = re.sub(r'(?i)(?:karta|raqam|egasi)\s*[:\-]?', '', clean_l).strip()
+            clean_l = re.sub(r'[^a-zA-Zа-яА-ЯёЁoʻo‘gʻg‘shch\s\.\']', '', clean_l).strip()
+            if len(clean_l) >= 4 and len(clean_l.split()) >= 1:
+                owner_name = clean_l
+                break
+
+    if not owner_name or len(owner_name) < 3:
+        return None, None, None, "❌ <b>Karta egasining Ism va Familiyasi to'liq kiritilmadi!</b>\nIltimos, karta egasining Ism-Familiyasini yozing (Masalan: ALIYEV VALI)."
+
+    return card_num, owner_name.upper(), id_val, None
+
 @router.message(F.chat.type.in_(["group", "supergroup"]))
 async def group_trade_moderator(msg: Message):
     chat_id = msg.chat.id
@@ -1657,8 +1729,12 @@ async def group_trade_moderator(msg: Message):
         )
         return
 
-    # Guruhdagi faol savdoni topish
-    deal = db.q("SELECT * FROM deals WHERE group_chat_id=? AND status IN ('in_trade', 'goods_delivered', 'buyer_statement', 'seller_statement', 'buyer_confirmed')", (chat_id,), one=True)
+    # Guruhdagi faol savdoni topish (to'lov amalga oshirilgunga qadar)
+    deal = db.q(
+        "SELECT * FROM deals WHERE group_chat_id=? AND status IN ('in_trade', 'goods_delivered', 'buyer_statement', 'seller_statement', 'waiting_seller_card', 'completed') AND (admin_payout_status IS NULL OR admin_payout_status != 'paid') ORDER BY created_at DESC",
+        (chat_id,),
+        one=True
+    )
     if not deal:
         return
 
@@ -1684,6 +1760,10 @@ async def group_trade_moderator(msg: Message):
     is_buyer = (msg.from_user.id == deal["buyer_id"] or user_un == (deal["buyer_username"] or "").lower())
     is_seller = (msg.from_user.id == deal["seller_id"] or user_un == (deal["seller_username"] or "").lower())
 
+    if is_seller and not deal["seller_id"]:
+        db.q("UPDATE deals SET seller_id=? WHERE deal_id=?", (msg.from_user.id, deal["deal_id"]), commit=True)
+        deal["seller_id"] = msg.from_user.id
+
     # Ikki tomonning tayyorligini tekshirish
     if deal["status"] == "in_trade" and (deal["group_buyer_ready"] == 0 or deal["group_seller_ready"] == 0):
         words = text.lower().split()
@@ -1706,144 +1786,191 @@ async def group_trade_moderator(msg: Message):
                 await msg.answer(f"Sizda {missing} tayyorligini bildirmagan, u yozgandagina savdo boshlanadi.")
             return
 
-    # Mahsulot topshirilgach xaridor tasdig'i ("oldim")
-    if is_buyer and any(w in text.lower() for w in ["men oldim", "oldim", "tekshirdim", "qabul qildim", "parol to'g'ri", "ishladi"]):
+    sample_buyer_stmt = f"Men {deal['title']}ni to'liq qabul qilib oldim, hech qanday da'voyim yo'q, agar keyinchalik muammo bo'lsa yoki sotuvchi qaytarib olsa, bot javob bermaydi"
+    sample_seller_stmt = "Men agar sotilgan narsani qaytarib olsam yoki aldov qilsam, qora ro'yxatga solishingizga roziman va to'liq javobgarlikni bo'ynimga olaman"
+
+    # 1. Mahsulot topshirilgach xaridor tasdig'i ("oldim", "akini oldim", "savdo yakunlandi" va h.k.)
+    # DIQQAT: Faqat bitim hali 'in_trade' yoki 'goods_delivered' holatida bo'lsagina arizaga o'tadi!
+    if is_buyer and deal["status"] in ("in_trade", "goods_delivered") and any(w in text.lower() for w in [
+        "men oldim", "oldim", "tekshirdim", "qabul qildim", "parol to'g'ri", "ishladi",
+        "akini oldim", "akkni oldim", "akkauntni oldim", "tovarni oldim", "savdo yakunlandi"
+    ]):
         db.q("UPDATE deals SET status='buyer_statement' WHERE deal_id=?", (deal["deal_id"],), commit=True)
         await msg.answer(
             f"✅ <b>Xaridor mahsulot olinganini tasdiqladi!</b>\n\n"
             f"1️⃣ <b>OLUVCHIDAN RASMIY TILXAT-ARIZA:</b>\n"
-            f"Xaridor @{esc_html(deal['buyer_username'])}, quyidagi matnni yozib yuboring:\n\n"
-            f"✍️ <i>«Men {esc_html(deal['title'])}ni to'liq qabul qilib oldim, da'voyim yo'q, agar keyinchalik sotuvchi qaytarib olsa yoki aldasa, bot javob bermaydi»</i>"
+            f"Xaridor @{esc_html(deal['buyer_username'])}, quyidagi tayyor matn ustiga bosing (nusxalanadi) va yuboring:\n\n"
+            f"✍️ <code>{esc_html(sample_buyer_stmt)}</code>"
         )
         return
 
-    # Oluvchi arizasi AI orqali qabul qilinishi
+    # 2. Oluvchi arizasini tekshirish
     if deal["status"] == "buyer_statement" and is_buyer:
-        is_valid_stmt, stmt_summary = await verify_statement_with_ai_async(text, "buyer", deal)
+        t_low = text.lower()
+        has_approval = any(w in t_low for w in ["qabul qilib oldim", "qabul qildim", "da'voyim yo'q", "davoyim yoq", "bot javob bermaydi", "hech qanday da'vo", "e'tirozim yo'q", "etirozim yoq"])
+
+        is_valid_stmt = False
+        stmt_summary = ""
+        if has_approval and len(text.strip()) >= 20:
+            is_valid_stmt = True
+            stmt_summary = "✅ Oluvchi arizasi qabul qilindi."
+        else:
+            is_valid_stmt, stmt_summary = await verify_statement_with_ai_async(text, "buyer", deal)
+
         if is_valid_stmt:
             db.q("UPDATE deals SET buyer_statement=?, status='seller_statement' WHERE deal_id=?", (text, deal["deal_id"]), commit=True)
             await msg.answer(
-                f"{stmt_summary}\n\n"
+                f"✅ <b>Oluvchi arizasi muvaffaqiyatli qabul qilindi!</b>\n\n"
                 f"2️⃣ <b>SOTUVCHIDAN RASMIY KAFOLAT-TILXAT:</b>\n"
-                f"Sotuvchi @{esc_html(deal['seller_username'])}, mahsulot bo'yicha kafolat arizangizni yozib yuboring:\n\n"
-                f"✍️ <i>«Men {esc_html(msg.from_user.full_name)} agar sotilgan narsani qaytarib olsam yoki aldov qilsam, qora ro'yxatga solishingizga roziman»</i>"
+                f"Sotuvchi @{esc_html(deal['seller_username'])}, sotilgan mahsulot bo'yicha kafolat arizangizni nusxalab yuboring (ustiga bosing):\n\n"
+                f"✍️ <code>{esc_html(sample_seller_stmt)}</code>"
             )
             return
         else:
-            await msg.reply(stmt_summary)
+            await msg.reply(
+                f"❌ <b>Arizangiz qabul qilinmadi (Noto'g'ri yozildi)!</b>\n\n"
+                f"Iltimos, arizani namunadagidek to'g'ri va to'liq qilib qaytadan yozing (ustiga bossangiz nusxalanadi):\n\n"
+                f"✍️ <code>{esc_html(sample_buyer_stmt)}</code>"
+            )
             return
 
-    # Sotuvchi arizasi AI orqali qabul qilinishi
+    # 3. Sotuvchi kafolat arizasini tekshirish
     if deal["status"] == "seller_statement" and is_seller:
-        is_valid_stmt, stmt_summary = await verify_statement_with_ai_async(text, "seller", deal)
+        t_low = text.lower()
+        has_warranty = any(w in t_low for w in ["qora ro'yxat", "qora royxat", "qaytarib olsam", "aldov qilsam", "aldamayman", "javobgarlik", "kafolat beraman", "roziman va"])
+
+        is_valid_stmt = False
+        stmt_summary = ""
+        if has_warranty and len(text.strip()) >= 20:
+            is_valid_stmt = True
+            stmt_summary = "✅ Sotuvchi kafolat arizasi qabul qilindi."
+        else:
+            is_valid_stmt, stmt_summary = await verify_statement_with_ai_async(text, "seller", deal)
+
         if is_valid_stmt:
-            db.q("UPDATE deals SET seller_statement=?, status='buyer_confirmed' WHERE deal_id=?", (text, deal["deal_id"]), commit=True)
+            db.q("UPDATE deals SET seller_statement=?, status='waiting_seller_card' WHERE deal_id=?", (text, deal["deal_id"]), commit=True)
+            db.q("UPDATE users SET completed_deals=completed_deals+1 WHERE user_id=?", (deal["buyer_id"],), commit=True)
+            if deal["seller_id"]:
+                db.q("UPDATE users SET completed_deals=completed_deals+1 WHERE user_id=?", (deal["seller_id"],), commit=True)
+
+            profane_str = deal.get("profane_users") or ""
+            if profane_str:
+                for bad_id in profane_str.split(","):
+                    if bad_id.strip():
+                        u_bad = db.get_user(int(bad_id.strip()))
+                        bad_un = u_bad["username"] if u_bad else ""
+                        db.add_to_blacklist(
+                            user_id=int(bad_id.strip()),
+                            username=bad_un,
+                            reason=f"Savdo #{deal['deal_id']} chatida so'kingan va qoidalarni buzgan",
+                            deal_id=deal["deal_id"],
+                            added_by="AI_Chat_Guardian"
+                        )
+
+            bot_info = await bot.get_me()
+            bot_un = f"@{bot_info.username}" if bot_info and bot_info.username else "@Xavsizsavdobot"
+
+            card_template = (
+                "1. Karta raqam: \n"
+                "2. Karta raqam egasi: \n"
+                f"3. ID raqamingiz: {msg.from_user.id}"
+            )
+
             await msg.answer(
-                f"{stmt_summary}\n\n"
-                f"Xaridor @{esc_html(deal['buyer_username'])}, savdo to'liq yakunlandimi? "
-                f"Pulni sotuvchiga o'tkazishga rozimisiz? Rozilik uchun <b>«ha roziman»</b> deb yozing:"
+                f"🎉 <b>HAR IKKALA TOMON ARIZALARI QABUL QILINDI!</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"Sotuvchi @{esc_html(deal['seller_username'])}, kelishilgan <b>{fmt(deal['amount'])} so'm</b> mablag'ni kartangizga qabul qilib olish uchun quyidagi tayyor shablonni to'ldirib yuboring:\n\n"
+                f"👇 <b>Ustiga bosing (nusxalanadi), to'ldiring va shu yerga yuboring:</b>\n"
+                f"<code>{card_template}</code>\n\n"
+                f"📌 <b>Shablonni to'ldirish tartibi:</b>\n"
+                f"1. <b>Karta raqam:</b> 16 xonali plastik kartangiz (Uzcard / Humo)\n"
+                f"2. <b>Karta raqam egasi:</b> Karta egasining Ism va Familiyasi\n"
+                f"3. <b>ID raqamingiz:</b> O'zingizning shaxsiy Telegram ID raqamingiz\n\n"
+                f"💡 <i>Telegram ID raqamingizni qayerdan olasiz?</i>\n"
+                f"👉 Bizning rasmiy botimiz: {bot_un} ga kirib <b>/start</b> yoki <b>/id</b> buyrug'ini bosing, yoki @userinfobot orqali ID raqamingizni bilib olishingiz mumkin."
             )
             return
         else:
-            await msg.reply(stmt_summary)
+            await msg.reply(
+                f"❌ <b>Kafolat arizangiz qabul qilinmadi (Noto'g'ri yozildi)!</b>\n\n"
+                f"Iltimos, namunadagidek to'g'ri va to'liq qilib qaytadan yozing (ustiga bossangiz nusxalanadi):\n\n"
+                f"✍️ <code>{esc_html(sample_seller_stmt)}</code>"
+            )
             return
 
-    # Xaridor yakuniy roziligi
-    if deal["status"] == "buyer_confirmed" and is_buyer and ("roziman" in text.lower() or "ha" in text.lower()):
-        db.q("UPDATE deals SET status='completed' WHERE deal_id=?", (deal["deal_id"],), commit=True)
-        db.q("UPDATE users SET completed_deals=completed_deals+1 WHERE user_id=?", (deal["buyer_id"],), commit=True)
-        if deal["seller_id"]:
-            db.q("UPDATE users SET completed_deals=completed_deals+1 WHERE user_id=?", (deal["seller_id"],), commit=True)
+    # 4. Sotuvchi shablonni to'ldirib yuborganda
+    if deal["status"] in ("waiting_seller_card", "completed") and is_seller and (not deal.get("seller_card") or deal.get("admin_payout_status") != "paid"):
+        card_num, owner_name, id_val, err = parse_seller_card_submission(text, msg.from_user.id)
+        bot_info = await bot.get_me()
+        bot_un = f"@{bot_info.username}" if bot_info and bot_info.username else "@Xavsizsavdobot"
 
-        # Savdo davomida so'kinganlarni avtomatik qora ro'yxatga kiritish
-        profane_str = deal.get("profane_users") or ""
-        if profane_str:
-            for bad_id in profane_str.split(","):
-                if bad_id.strip():
-                    u_bad = db.get_user(int(bad_id.strip()))
-                    bad_un = u_bad["username"] if u_bad else ""
-                    db.add_to_blacklist(
-                        user_id=int(bad_id.strip()),
-                        username=bad_un,
-                        reason=f"Savdo #{deal['deal_id']} chatida so'kingan va haqorat qilgan (AI qorovul)",
-                        deal_id=deal["deal_id"],
-                        added_by="AI_Chat_Guardian"
-                    )
-                    await msg.answer(
-                        f"🚫 <b>AVTOMATIK QORA RO'YXATGA KIRITILDI!</b>\n"
-                        f"Foydalanuvchi @{esc_html(bad_un or bad_id)} savdo davomida so'kingani va qoidalarni buzgani sababli "
-                        f"<b>QORA RO'YXATGA (Blacklist)</b> kiritildi va botdan bloklandi!"
-                    )
+        if err:
+            card_template = (
+                "1. Karta raqam: \n"
+                "2. Karta raqam egasi: \n"
+                f"3. ID raqamingiz: {msg.from_user.id}"
+            )
+            await msg.reply(
+                f"{err}\n\n"
+                f"👇 <b>Tayyor shablondan foydalaning (ustiga bosib nusxalang):</b>\n"
+                f"<code>{card_template}</code>\n\n"
+                f"💡 <i>O'z Telegram ID raqamingizni {bot_un} botiga kirib /start yoki /id bosib bilib olishingiz mumkin.</i>"
+            )
+            return
+
+        # Ma'lumotlar to'liq va to'g'ri bo'lsa - bazaga saqlash
+        db.q(
+            "UPDATE deals SET seller_card=?, seller_card_owner=?, seller_id=?, status='completed' WHERE deal_id=?",
+            (card_num, owner_name, msg.from_user.id, deal["deal_id"]),
+            commit=True
+        )
+        db.q("UPDATE users SET completed_deals=completed_deals+1 WHERE user_id=?", (msg.from_user.id,), commit=True)
+
+        buyer = db.get_user(deal["buyer_id"])
+        buyer_deals = buyer["completed_deals"] if buyer else 1
+        payout = calculate_payout_details(deal, buyer_deals - 1)
 
         await msg.answer(
-            f"🎉 <b>XARIDOR ROZILIK BILDIRDI! SAVDO MUVAFFAQIYATLI YAKUNLANDI.</b>\n"
+            f"✅ <b>Sizning so'rovingiz adminga yuborildi!</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Sotuvchi @{esc_html(deal['seller_username'])}, kelishilgan <b>{fmt(deal['amount'])} so'm</b> mablag'ni olish uchun "
-            f"<b>16 xonali plastik karta raqamingiz va Ism-Familiyangizni</b> shu yerga yozing:\n"
-            f"<i>(Masalan: 8600 1234 5678 9012 ALIYEV VALI)</i>"
+            f"💳 <b>Karta raqam:</b> <code>{format_card(card_num)}</code>\n"
+            f"👤 <b>Karta egasi:</b> <b>{esc_html(owner_name)}</b>\n"
+            f"🆔 <b>Tasdiqlangan Telegram ID:</b> <code>{msg.from_user.id}</code>\n"
+            f"💵 <b>O'tkaziladigan sof summa:</b> <b>{fmt(payout['net_to_seller'])} so'm</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"⏳ <b>Tez orada pulingiz kartangizga tushadi!</b>\n\n"
+            f"Ungacha siz bizning rasmiy botimizga ({bot_un}) o'tib, <b>/start</b> bosib, majburiy kanallarga obuna bo'lib qo'ysangiz, pul tushgach bot sizga darhol xabar va rasmiy to'lov chekini yuboradi!"
         )
+
+        admin_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Sotuvchiga pul tashlandi", callback_data=f"adm_paid_seller:{deal['deal_id']}")]
+        ])
+
+        for a_id in ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    a_id,
+                    f"💰 <b>GURUH SAVDOSI YAKUNLANDI! SOTUVCHIGA PUL O'TKAZING:</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"Bitim raqami: <b>#{deal['deal_id']}</b>\n"
+                    f"Tovar: <b>{esc_html(deal['title'])}</b>\n"
+                    f"Xaridor: @{esc_html(deal['buyer_username'])} (ID: <code>{deal['buyer_id']}</code>)\n"
+                    f"Sotuvchi: @{esc_html(deal['seller_username'])} (ID: <code>{msg.from_user.id}</code>)\n\n"
+                    f"💳 <b>Sotuvchi kartasi:</b> <code>{format_card(card_num)}</code>\n"
+                    f"👤 <b>Karta egasi:</b> <b>{esc_html(owner_name)}</b>\n"
+                    f"🆔 <b>Telegram ID:</b> <code>{msg.from_user.id}</code>\n\n"
+                    f"📊 <b>AI MOLIYAVIY HISOB-KITOBI:</b>\n"
+                    f"• Savdo summasi: <b>{fmt(deal['amount'])} so'm</b>\n"
+                    f"• Kafil komissiyasi ({payout['fee_pct']}%): <b>{fmt(payout['fee'])} so'm</b>\n"
+                    f"• Jami to'langan depozit: <b>{fmt(payout['total_paid'])} so'm</b>\n"
+                    f"• 💵 <b>SOTUVCHIGA O'TKAZILADIGAN SUMMA:</b> <code>{fmt(payout['net_to_seller'])} so'm</code>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"Sotuvchi kartasiga pulni tashlab, quyidagi tugmani bosing:",
+                    reply_markup=admin_kb
+                )
+            except Exception as e:
+                logger.error(f"Adminga yuborishda xato: {e}")
         return
-
-    # Sotuvchi karta raqamini berganda
-    if deal["status"] == "completed" and is_seller:
-        raw_digits = re.sub(r"\D", "", text)
-        if len(raw_digits) >= 16:
-            card_num = raw_digits[:16]
-            owner_name = re.sub(r"[0-9\s]+", " ", text).strip().upper()
-            if not owner_name or len(owner_name) < 3:
-                owner_name = "SOTUVCHI"
-            db.q("UPDATE deals SET seller_card=?, seller_card_owner=? WHERE deal_id=?", (card_num, owner_name, deal["deal_id"]), commit=True)
-
-            buyer = db.get_user(deal["buyer_id"])
-            buyer_deals = buyer["completed_deals"] if buyer else 1
-            payout = calculate_payout_details(deal, buyer_deals - 1)
-
-            await msg.answer(
-                f"💳 <b>SOTUVCHI KARTASI QABUL QILINDI VA TEKSHIRILDI:</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"Plastik karta: <code>{format_card(card_num)}</code>\n"
-                f"Karta egasi: <b>{esc_html(owner_name)}</b>\n"
-                f"O'tkaziladigan sof summa: <b>{fmt(payout['net_to_seller'])} so'm</b>\n\n"
-                f"🤖 <b>AI XULOSASI:</b>\n"
-                f"Moliyaviy hisob-kitoblar to'liq tekshirildi. Mablag' Garant Administratsiyasiga to'lov uchun yuborildi.\n"
-                f"Admin pulni kartangizga o'tkazishi bilan ushbu chatga tasdiq xabarnomasi yuboriladi!"
-            )
-
-            admin_kb = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="✅ Sotuvchiga pul tashlandi", callback_data=f"adm_paid_seller:{deal['deal_id']}")]
-            ])
-
-            for a_id in ADMIN_IDS:
-                try:
-                    await bot.send_message(
-                        a_id,
-                        f"💰 <b>GURUH SAVDOSI YAKUNLANDI! SOTUVCHIGA PUL O'TKAZING:</b>\n"
-                        f"━━━━━━━━━━━━━━━━━━━━\n"
-                        f"Bitim raqami: <b>#{deal['deal_id']}</b>\n"
-                        f"Tovar: <b>{esc_html(deal['title'])}</b>\n"
-                        f"Xaridor: @{esc_html(deal['buyer_username'])} (ID: <code>{deal['buyer_id']}</code>)\n"
-                        f"Sotuvchi: @{esc_html(deal['seller_username'])} (ID: <code>{deal['seller_id']}</code>)\n\n"
-                        f"💳 <b>Sotuvchi kartasi:</b> <code>{format_card(card_num)}</code>\n"
-                        f"👤 <b>Karta egasi:</b> <b>{esc_html(owner_name)}</b>\n\n"
-                        f"📊 <b>AI MOLIYAVIY HISOB-KITOBI:</b>\n"
-                        f"• Savdo summasi: <b>{fmt(deal['amount'])} so'm</b>\n"
-                        f"• Kafil komissiyasi ({payout['fee_pct']}%): <b>{fmt(payout['fee'])} so'm</b>\n"
-                        f"• Jami to'langan depozit: <b>{fmt(payout['total_paid'])} so'm</b>\n"
-                        f"• 💵 <b>SOTUVCHIGA O'TKAZILADIGAN SUMMA:</b> <code>{fmt(payout['net_to_seller'])} so'm</code>\n"
-                        f"━━━━━━━━━━━━━━━━━━━━\n"
-                        f"Sotuvchi kartasiga pulni tashlab, quyidagi tugmani bosing:",
-                        reply_markup=admin_kb
-                    )
-                except Exception as e:
-                    logger.error(f"Adminga yuborishda xato: {e}")
-            return
-        elif any(char.isdigit() for char in text):
-            await msg.reply(
-                "⚠️ <b>Karta raqami to'liq emas!</b>\n"
-                "Iltimos, 16 xonali plastik karta raqamingiz va Ism-Familiyangizni to'g'ri kiriting:\n"
-                "<i>Misol: 8600 1234 5678 9012 ALIYEV VALI</i>"
-            )
-            return
 
 @router.chat_member()
 async def group_member_left_monitor(event: ChatMemberUpdated):
@@ -2363,9 +2490,18 @@ async def adm_paid_seller_cb(call: CallbackQuery):
         await call.message.answer("Bitim topilmadi.")
         return
 
-    db.q("UPDATE deals SET admin_payout_status='paid' WHERE deal_id=?", (d_id,), commit=True)
+    now_dt = datetime.now()
+    now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    db.q("UPDATE deals SET admin_payout_status='paid', status='completed', updated_at=? WHERE deal_id=?", (now_str, d_id), commit=True)
+
+    bot_info = await bot.get_me()
+    bot_un = f"@{bot_info.username}" if bot_info and bot_info.username else "@Xavsizsavdobot"
+
     card_f = format_card(deal["seller_card"] or "")
     amt_f = fmt(deal["amount"])
+    owner_name = deal.get("seller_card_owner") or "Sotuvchi"
+    seller_uid = deal.get("seller_id")
 
     # Guruh chatiga xabar berish
     if deal.get("group_chat_id"):
@@ -2374,30 +2510,40 @@ async def adm_paid_seller_cb(call: CallbackQuery):
                 deal["group_chat_id"],
                 f"🎉 <b>MABLAG' SOTUVCHI KARTASIGA MUVAFFAQIYATLI O'TKAZILDI!</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"Garant Admini sotuvchi @{esc_html(deal['seller_username'])} ning <code>{card_f}</code> kartasiga "
+                f"<b>[ ✅ TO'LOV O'TKAZILDI ]</b>\n\n"
+                f"Garant Admini sotuvchi @{esc_html(deal['seller_username'])} ning <code>{card_f}</code> ({esc_html(owner_name)}) kartasiga "
                 f"<b>{amt_f} so'm</b> pulni to'liq o'tkazib berdi!\n\n"
+                f"📅 <b>Sana va vaqt:</b> <code>{now_str}</code>\n"
+                f"🤖 <b>Kafillik xizmati:</b> {bot_un}\n\n"
                 f"🛡 Kafil botidan foydalanganingiz uchun rahmat! Savdo 100% xavfsiz va muvaffaqiyatli yakunlandi."
             )
         except Exception:
             pass
 
-    # Sotuvchiga to'g'ridan-to'g'ri xabar berish
-    if deal.get("seller_id"):
+    # Sotuvchiga to'g'ridan-to'g'ri RASMIY TO'LOV CHEKI yuborish
+    if seller_uid:
         try:
-            await bot.send_message(
-                deal["seller_id"],
-                f"🎉 <b>TO'LOV KARTANGIZGA O'TKAZILDI! (#{d_id})</b>\n"
+            receipt_msg = (
+                f"🧾 <b>RASMIY TO'LOV CHEKI</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"Karta: <code>{card_f}</code> ({esc_html(deal['seller_card_owner'] or '')})\n"
-                f"Summa: <b>{amt_f} so'm</b>\n\n"
-                f"Kafil xizmatidan foydalanganingiz uchun rahmat!"
+                f"<b>[ ✅ TO'LOV MUVAFFAQIYATLI O'TKAZILDI ]</b>\n\n"
+                f"💰 <b>To'lov summasi:</b> <b>{amt_f} so'm</b>\n"
+                f"💳 <b>Qabul qiluvchi karta:</b> <code>{card_f}</code>\n"
+                f"👤 <b>Karta egasi:</b> <b>{esc_html(owner_name)}</b>\n"
+                f"🆔 <b>Qabul qiluvchi ID:</b> <code>{seller_uid}</code>\n"
+                f"📅 <b>Sana va vaqt:</b> <code>{now_str}</code>\n"
+                f"🤖 <b>Xizmat ko'rsatuvchi bot:</b> {bot_un}\n"
+                f"📦 <b>Bitim:</b> #{d_id} ({esc_html(deal.get('title', 'Tovar'))})\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"✨ <i>Kelishilgan mablag' kartangizga muvaffaqiyatli o'tkazildi. Xizmatimizdan foydalanganingiz uchun tashakkur!</i>"
             )
-        except Exception:
-            pass
+            await bot.send_message(seller_uid, receipt_msg)
+        except Exception as e:
+            logger.warning(f"Sotuvchiga chek yuborishda xato: {e}")
 
     try:
         await call.message.edit_text(
-            call.message.html_text + f"\n\n✅ <b>ADMIN TASDIQLADI:</b> Pul sotuvchi kartasiga muvaffaqiyatli o'tkazildi!",
+            call.message.html_text + f"\n\n✅ <b>ADMIN TASDIQLADI:</b> Pul sotuvchi kartasiga o'tkazildi va rasmiy chek yuborildi!\n📅 {now_str}",
             reply_markup=None
         )
     except Exception:
@@ -2547,7 +2693,7 @@ async def private_trade_chat_router(msg: Message, state: FSMContext):
         return
 
     uid = msg.from_user.id
-    deal = db.q("SELECT * FROM deals WHERE (buyer_id=? OR seller_id=?) AND mode='bot' AND status IN ('in_trade', 'goods_delivered', 'buyer_statement', 'seller_statement', 'buyer_confirmed') ORDER BY updated_at DESC LIMIT 1", (uid, uid), one=True)
+    deal = db.q("SELECT * FROM deals WHERE (buyer_id=? OR seller_id=?) AND mode='bot' AND status IN ('in_trade', 'goods_delivered', 'buyer_statement', 'seller_statement', 'waiting_seller_card', 'completed') AND (admin_payout_status IS NULL OR admin_payout_status != 'paid') ORDER BY updated_at DESC LIMIT 1", (uid, uid), one=True)
     if not deal:
         await msg.answer(
             "Assalomu alaykum! Kerakli bo'limni tanlash uchun pastdagi menyudan foydalaning:",
@@ -2589,101 +2735,183 @@ async def private_trade_chat_router(msg: Message, state: FSMContext):
         except Exception:
             pass
 
-    # Sotuvchi bitim yakunlangach karta raqamini berganda
-    if not is_buyer and deal["status"] in ("completed", "goods_delivered"):
-        raw_digits = re.sub(r"\D", "", text_content)
-        if len(raw_digits) >= 16:
-            card_num = raw_digits[:16]
-            owner_name = re.sub(r"[0-9\s]+", " ", text_content).strip().upper()
-            if not owner_name or len(owner_name) < 3:
-                owner_name = "SOTUVCHI"
-            db.q("UPDATE deals SET seller_card=?, seller_card_owner=? WHERE deal_id=?", (card_num, owner_name, deal["deal_id"]), commit=True)
+    # 1. Mahsulot topshirilgach xaridor tasdig'i ("oldim")
+    if is_buyer and deal["status"] in ("in_trade", "goods_delivered") and any(w in text_content.lower() for w in [
+        "men oldim", "oldim", "tekshirdim", "qabul qildim", "parol to'g'ri", "ishladi",
+        "akini oldim", "akkni oldim", "akkauntni oldim", "tovarni oldim", "savdo yakunlandi"
+    ]):
+        db.q("UPDATE deals SET status='buyer_statement', updated_at=? WHERE deal_id=?", (now_s, deal["deal_id"]), commit=True)
+        sample_buyer_stmt = f"Men {deal['title']}ni to'liq qabul qilib oldim, hech qanday da'voyim yo'q, agar keyinchalik muammo bo'lsa yoki sotuvchi qaytarib olsa, bot javob bermaydi"
+        await msg.answer(
+            f"✅ <b>Xaridor mahsulot olinganini tasdiqladi!</b>\n\n"
+            f"1️⃣ <b>OLUVCHIDAN RASMIY TILXAT-ARIZA:</b>\n"
+            f"Xaridor @{esc_html(deal['buyer_username'])}, quyidagi tayyor matn ustiga bosing (nusxalanadi) va yuboring:\n\n"
+            f"✍️ <code>{esc_html(sample_buyer_stmt)}</code>"
+        )
+        return
 
-            buyer = db.get_user(deal["buyer_id"])
-            buyer_deals = buyer["completed_deals"] if buyer else 1
-            payout = calculate_payout_details(deal, buyer_deals - 1)
+    # 2. Oluvchi arizasini tekshirish
+    if deal["status"] == "buyer_statement" and is_buyer:
+        sample_buyer_stmt = f"Men {deal['title']}ni to'liq qabul qilib oldim, hech qanday da'voyim yo'q, agar keyinchalik muammo bo'lsa yoki sotuvchi qaytarib olsa, bot javob bermaydi"
+        sample_seller_stmt = "Men agar sotilgan narsani qaytarib olsam yoki aldov qilsam, qora ro'yxatga solishingizga roziman va to'liq javobgarlikni bo'ynimga olaman"
 
+        t_low = text_content.lower()
+        has_approval = any(w in t_low for w in ["qabul qilib oldim", "qabul qildim", "da'voyim yo'q", "davoyim yoq", "bot javob bermaydi", "hech qanday da'vo", "e'tirozim yo'q", "etirozim yoq"])
+
+        is_valid_stmt = False
+        stmt_summary = ""
+        if has_approval and len(text_content.strip()) >= 20:
+            is_valid_stmt = True
+            stmt_summary = "✅ Oluvchi arizasi qabul qilindi."
+        else:
+            is_valid_stmt, stmt_summary = await verify_statement_with_ai_async(text_content, "buyer", deal)
+
+        if is_valid_stmt:
+            db.q("UPDATE deals SET buyer_statement=?, status='seller_statement', updated_at=? WHERE deal_id=?", (text_content, now_s, deal["deal_id"]), commit=True)
             await msg.answer(
-                f"💳 <b>KARTANGIZ QABUL QILINDI:</b> <code>{format_card(card_num)}</code> ({esc_html(owner_name)})\n"
-                f"O'tkaziladigan sof summa: <b>{fmt(payout['net_to_seller'])} so'm</b>\n\n"
-                f"🤖 <b>AI XULOSASI:</b> Hisob-kitoblar to'liq tekshirildi. Mablag' Garant Administratsiyasiga yuborildi.\n"
-                f"Admin pulni kartangizga o'tkazishi bilan xabarnoma olasiz!"
+                f"✅ <b>Arizangiz qabul qilindi!</b>\n\nEndi sotuvchidan kafolat arizasi kutilmoqda."
             )
-
-            admin_kb = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="✅ Sotuvchiga pul tashlandi", callback_data=f"adm_paid_seller:{deal['deal_id']}")]
-            ])
-
-            for a_id in ADMIN_IDS:
+            if deal["seller_id"]:
                 try:
                     await bot.send_message(
-                        a_id,
-                        f"💰 <b>SAVDO YAKUNLANDI! SOTUVCHIGA PUL O'TKAZING:</b>\n"
-                        f"━━━━━━━━━━━━━━━━━━━━\n"
-                        f"Bitim: <b>#{deal['deal_id']}</b>\n"
-                        f"Tovar: <b>{esc_html(deal['title'])}</b>\n"
-                        f"Xaridor: @{esc_html(deal['buyer_username'])} (ID: <code>{deal['buyer_id']}</code>)\n"
-                        f"Sotuvchi: @{esc_html(deal['seller_username'])} (ID: <code>{deal['seller_id']}</code>)\n\n"
-                        f"💳 <b>Sotuvchi kartasi:</b> <code>{format_card(card_num)}</code>\n"
-                        f"👤 <b>Karta egasi:</b> <b>{esc_html(owner_name)}</b>\n\n"
-                        f"📊 <b>AI MOLIYAVIY HISOB-KITOBI:</b>\n"
-                        f"• Savdo summasi: <b>{fmt(deal['amount'])} so'm</b>\n"
-                        f"• Kafil komissiyasi ({payout['fee_pct']}%): <b>{fmt(payout['fee'])} so'm</b>\n"
-                        f"• Jami to'langan depozit: <b>{fmt(payout['total_paid'])} so'm</b>\n"
-                        f"• 💵 <b>SOTUVCHIGA O'TKAZILADIGAN SUMMA:</b> <code>{fmt(payout['net_to_seller'])} so'm</code>\n"
-                        f"━━━━━━━━━━━━━━━━━━━━\n"
-                        f"Sotuvchi kartasiga pulni tashlab, quyidagi tugmani bosing:",
-                        reply_markup=admin_kb
+                        deal["seller_id"],
+                        f"✅ <b>Oluvchi arizasi qabul qilindi!</b>\n\n"
+                        f"2️⃣ <b>SOTUVCHIDAN RASMIY KAFOLAT-TILXAT:</b>\n"
+                        f"Sotuvchi @{esc_html(deal['seller_username'])}, mahsulot bo'yicha kafolat arizangizni nusxalab yuboring (ustiga bosing):\n\n"
+                        f"✍️ <code>{esc_html(sample_seller_stmt)}</code>"
                     )
                 except Exception:
                     pass
             return
+        else:
+            await msg.reply(
+                f"❌ <b>Arizangiz qabul qilinmadi (Noto'g'ri yozildi)!</b>\n\n"
+                f"Iltimos, arizani namunadagidek to'g'ri va to'liq qilib qaytadan yozing (ustiga bossangiz nusxalanadi):\n\n"
+                f"✍️ <code>{esc_html(sample_buyer_stmt)}</code>"
+            )
+            return
 
-    if is_buyer and any(w in text_content.lower() for w in ["men oldim", "oldim", "tekshirdim", "qabul qildim", "parol to'g'ri", "ishladi"]):
-        db.q("UPDATE deals SET status='completed', updated_at=? WHERE deal_id=?", (now_s, deal["deal_id"]), commit=True)
-        db.q("UPDATE users SET completed_deals=completed_deals+1 WHERE user_id=?", (deal["buyer_id"],), commit=True)
-        if deal["seller_id"]:
-            db.q("UPDATE users SET completed_deals=completed_deals+1 WHERE user_id=?", (deal["seller_id"],), commit=True)
+    # 3. Sotuvchi kafolat arizasini tekshirish
+    if deal["status"] == "seller_statement" and not is_buyer:
+        sample_seller_stmt = "Men agar sotilgan narsani qaytarib olsam yoki aldov qilsam, qora ro'yxatga solishingizga roziman va to'liq javobgarlikni bo'ynimga olaman"
+        t_low = text_content.lower()
+        has_warranty = any(w in t_low for w in ["qora ro'yxat", "qora royxat", "qaytarib olsam", "aldov qilsam", "aldamayman", "javobgarlik", "kafolat beraman", "roziman va"])
 
-        # Savdo davomida so'kinganlarni avtomatik qora ro'yxatga kiritish
-        profane_str = deal.get("profane_users") or ""
-        if profane_str:
-            for bad_id in profane_str.split(","):
-                if bad_id.strip():
-                    u_bad = db.get_user(int(bad_id.strip()))
-                    bad_un = u_bad["username"] if u_bad else ""
-                    db.add_to_blacklist(
-                        user_id=int(bad_id.strip()),
-                        username=bad_un,
-                        reason=f"Savdo #{deal['deal_id']} chatida so'kingan va haqorat qilgan (AI qorovul)",
-                        deal_id=deal["deal_id"],
-                        added_by="AI_Chat_Guardian"
-                    )
-                    await msg.answer(
-                        f"🚫 <b>AVTOMATIK QORA RO'YXATGA KIRITILDI!</b>\n"
-                        f"Foydalanuvchi @{esc_html(bad_un or bad_id)} savdo davomida so'kingani sababli "
-                        f"<b>QORA RO'YXATGA (Blacklist)</b> kiritildi va botdan bloklandi!"
-                    )
+        is_valid_stmt = False
+        stmt_summary = ""
+        if has_warranty and len(text_content.strip()) >= 20:
+            is_valid_stmt = True
+            stmt_summary = "✅ Sotuvchi kafolat arizasi qabul qilindi."
+        else:
+            is_valid_stmt, stmt_summary = await verify_statement_with_ai_async(text_content, "seller", deal)
 
-        finish_text = (
-            f"🎉 <b>SAVDO MUVAFFAQIYATLI YAKUNLANDI! (#{deal['deal_id']})</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Tovar: <b>{esc_html(deal['title'])}</b>\n"
-            f"Summa: <b>{fmt(deal['amount'])} so'm</b>\n\n"
-            f"Kafolatli Garant xizmatidan foydalanganingiz uchun rahmat!"
+        if is_valid_stmt:
+            db.q("UPDATE deals SET seller_statement=?, status='waiting_seller_card', updated_at=? WHERE deal_id=?", (text_content, now_s, deal["deal_id"]), commit=True)
+            db.q("UPDATE users SET completed_deals=completed_deals+1 WHERE user_id=?", (deal["buyer_id"],), commit=True)
+            if deal["seller_id"]:
+                db.q("UPDATE users SET completed_deals=completed_deals+1 WHERE user_id=?", (deal["seller_id"],), commit=True)
+
+            bot_info = await bot.get_me()
+            bot_un = f"@{bot_info.username}" if bot_info and bot_info.username else "@Xavsizsavdobot"
+
+            card_template = (
+                "1. Karta raqam: \n"
+                "2. Karta raqam egasi: \n"
+                f"3. ID raqamingiz: {msg.from_user.id}"
+            )
+
+            await msg.answer(
+                f"🎉 <b>HAR IKKALA TOMON ARIZALARI QABUL QILINDI!</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"Sotuvchi @{esc_html(deal['seller_username'])}, kelishilgan <b>{fmt(deal['amount'])} so'm</b> mablag'ni kartangizga qabul qilib olish uchun quyidagi tayyor shablonni to'ldirib yuboring:\n\n"
+                f"👇 <b>Ustiga bosing (nusxalanadi), to'ldiring va shu yerga yuboring:</b>\n"
+                f"<code>{card_template}</code>\n\n"
+                f"📌 <b>Shablonni to'ldirish tartibi:</b>\n"
+                f"1. <b>Karta raqam:</b> 16 xonali plastik kartangiz (Uzcard / Humo)\n"
+                f"2. <b>Karta raqam egasi:</b> Karta egasining Ism va Familiyasi\n"
+                f"3. <b>ID raqamingiz:</b> O'zingizning shaxsiy Telegram ID raqamingiz\n\n"
+                f"💡 <i>Telegram ID raqamingizni bilish uchun {bot_un} da /id bosing yoki @userinfobot orqali oling.</i>"
+            )
+            return
+        else:
+            await msg.reply(
+                f"❌ <b>Kafolat arizangiz qabul qilinmadi (Noto'g'ri yozildi)!</b>\n\n"
+                f"Iltimos, namunadagidek to'g'ri va to'liq qilib qaytadan yozing (ustiga bossangiz nusxalanadi):\n\n"
+                f"✍️ <code>{esc_html(sample_seller_stmt)}</code>"
+            )
+            return
+
+    # 4. Sotuvchi shablonni to'ldirib yuborganda
+    if deal["status"] in ("waiting_seller_card", "completed") and not is_buyer and (not deal.get("seller_card") or deal.get("admin_payout_status") != "paid"):
+        card_num, owner_name, id_val, err = parse_seller_card_submission(text_content, msg.from_user.id)
+        bot_info = await bot.get_me()
+        bot_un = f"@{bot_info.username}" if bot_info and bot_info.username else "@Xavsizsavdobot"
+
+        if err:
+            card_template = (
+                "1. Karta raqam: \n"
+                "2. Karta raqam egasi: \n"
+                f"3. ID raqamingiz: {msg.from_user.id}"
+            )
+            await msg.reply(
+                f"{err}\n\n"
+                f"👇 <b>Tayyor shablondan foydalaning (ustiga bosib nusxalang):</b>\n"
+                f"<code>{card_template}</code>\n\n"
+                f"💡 <i>O'z Telegram ID raqamingizni {bot_un} botiga kirib /start yoki /id bosib bilib olishingiz mumkin.</i>"
+            )
+            return
+
+        db.q(
+            "UPDATE deals SET seller_card=?, seller_card_owner=?, seller_id=?, status='completed', updated_at=? WHERE deal_id=?",
+            (card_num, owner_name, msg.from_user.id, now_s, deal["deal_id"]),
+            commit=True
         )
-        await msg.answer(finish_text, reply_markup=main_menu_keyboard(uid))
-        if deal["seller_id"]:
+
+        buyer = db.get_user(deal["buyer_id"])
+        buyer_deals = buyer["completed_deals"] if buyer else 1
+        payout = calculate_payout_details(deal, buyer_deals - 1)
+
+        await msg.answer(
+            f"✅ <b>Sizning so'rovingiz adminga yuborildi!</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💳 <b>Karta raqam:</b> <code>{format_card(card_num)}</code>\n"
+            f"👤 <b>Karta egasi:</b> <b>{esc_html(owner_name)}</b>\n"
+            f"🆔 <b>Tasdiqlangan Telegram ID:</b> <code>{msg.from_user.id}</code>\n"
+            f"💵 <b>O'tkaziladigan sof summa:</b> <b>{fmt(payout['net_to_seller'])} so'm</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"⏳ <b>Tez orada pulingiz kartangizga tushadi!</b>\n\n"
+            f"Admin pulni kartangizga o'tkazishi bilan ushbu bot orqali rasmiy to'lov cheki olasiz!"
+        )
+
+        admin_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Sotuvchiga pul tashlandi", callback_data=f"adm_paid_seller:{deal['deal_id']}")]
+        ])
+
+        for a_id in ADMIN_IDS:
             try:
-                seller_finish = (
-                    f"🎉 <b>XARIDOR TOVARNI QABUL QILDI! SAVDO YAKUNLANDI. (#{deal['deal_id']})</b>\n"
+                await bot.send_message(
+                    a_id,
+                    f"💰 <b>SAVDO YAKUNLANDI! SOTUVCHIGA PUL O'TKAZING:</b>\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"Sizga o'tkaziladigan summa: <b>{fmt(deal['amount'])} so'm</b>\n\n"
-                    f"💳 To'lovni olish uchun 16 xonali plastik karta raqamingiz va Ism-Familiyangizni shu yerga yozing:"
+                    f"Bitim: <b>#{deal['deal_id']}</b>\n"
+                    f"Tovar: <b>{esc_html(deal['title'])}</b>\n"
+                    f"Xaridor: @{esc_html(deal['buyer_username'])} (ID: <code>{deal['buyer_id']}</code>)\n"
+                    f"Sotuvchi: @{esc_html(deal['seller_username'])} (ID: <code>{msg.from_user.id}</code>)\n\n"
+                    f"💳 <b>Sotuvchi kartasi:</b> <code>{format_card(card_num)}</code>\n"
+                    f"👤 <b>Karta egasi:</b> <b>{esc_html(owner_name)}</b>\n"
+                    f"🆔 <b>Telegram ID:</b> <code>{msg.from_user.id}</code>\n\n"
+                    f"📊 <b>AI MOLIYAVIY HISOB-KITOBI:</b>\n"
+                    f"• Savdo summasi: <b>{fmt(deal['amount'])} so'm</b>\n"
+                    f"• Kafil komissiyasi ({payout['fee_pct']}%): <b>{fmt(payout['fee'])} so'm</b>\n"
+                    f"• Jami to'langan depozit: <b>{fmt(payout['total_paid'])} so'm</b>\n"
+                    f"• 💵 <b>SOTUVCHIGA O'TKAZILADIGAN SUMMA:</b> <code>{fmt(payout['net_to_seller'])} so'm</code>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"Sotuvchi kartasiga pulni tashlab, quyidagi tugmani bosing:",
+                    reply_markup=admin_kb
                 )
-                await bot.send_message(deal["seller_id"], seller_finish)
             except Exception:
                 pass
+        return
 
 # ============================ 19. RENDER DUMMY WEB SERVER ============================
 async def run_render_web_server():
