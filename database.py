@@ -26,9 +26,8 @@ def q(query: str, args: tuple = (), one: bool = False, commit: bool = False) -> 
             conn.commit()
             return cur.lastrowid
         if one:
-            row = cur.fetchone()
-            return dict(row) if row else None
-        return [dict(r) for r in cur.fetchall()]
+            return cur.fetchone()
+        return cur.fetchall()
     finally:
         conn.close()
 
@@ -189,12 +188,38 @@ def init_db():
     )
     """)
 
+    # 11. user_channels (Foydalanuvchilar ulagan kanallar)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS user_channels (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        channel_id TEXT UNIQUE,
+        channel_title TEXT,
+        channel_username TEXT,
+        channel_link TEXT,
+        last_post_at TEXT,
+        total_posts INTEGER DEFAULT 0,
+        created_at TEXT,
+        is_active INTEGER DEFAULT 1
+    )
+    """)
+
     # Mavjud bazalar uchun ustunlarni tekshirish va qo'shish
     user_cols = [r[1] for r in cur.execute("PRAGMA table_info(users)").fetchall()]
     if "referral_balance" not in user_cols:
         cur.execute("ALTER TABLE users ADD COLUMN referral_balance INTEGER DEFAULT 0")
     if "referred_by" not in user_cols:
         cur.execute("ALTER TABLE users ADD COLUMN referred_by INTEGER DEFAULT NULL")
+    if "phone_number" not in user_cols:
+        cur.execute("ALTER TABLE users ADD COLUMN phone_number TEXT DEFAULT NULL")
+
+    ref_cols = [r[1] for r in cur.execute("PRAGMA table_info(referrals)").fetchall()]
+    if "source_channel_id" not in ref_cols:
+        cur.execute("ALTER TABLE referrals ADD COLUMN source_channel_id TEXT DEFAULT NULL")
+    if "deal_reward_given" not in ref_cols:
+        cur.execute("ALTER TABLE referrals ADD COLUMN deal_reward_given INTEGER DEFAULT 0")
+    if "updated_at" not in ref_cols:
+        cur.execute("ALTER TABLE referrals ADD COLUMN updated_at TEXT DEFAULT NULL")
 
     deal_cols = [r[1] for r in cur.execute("PRAGMA table_info(deals)").fetchall()]
     for col, col_type in [
@@ -222,10 +247,18 @@ def init_db():
         set_setting("card_owner", DEFAULT_CARD_OWNER)
     if not get_setting("commission_percent"):
         set_setting("commission_percent", "10")
+    if not get_setting("channel_post_interval_hours"):
+        set_setting("channel_post_interval_hours", "1")
+    if not get_setting("referral_reward_amount"):
+        set_setting("referral_reward_amount", "100")
+    if not get_setting("channel_ad_text"):
+        set_setting("channel_ad_text", "🔥 <b>KAFOLATLI VA ISHONCHLI SAVDO BOTI!</b>\n\n🛡 Ushbu bot orqali begona shaxslar bilan har qanday tovar, kanal, akkaunt va xizmatlarni 100% xavfsiz sotib olishingiz yoki sotishingiz mumkin!\n💰 Shuningdek, botga do'stlaringizni taklif qilib, har bir do'stingiz uchun pul mukofotlarini ishlab olishingiz mumkin.")
 
 init_db()
 
 # ==================== FOYDALANUVCHILAR ====================
+def update_user_phone(user_id: int, phone: str):
+    q("UPDATE users SET phone_number=? WHERE user_id=?", (phone, user_id), commit=True)
 def ensure_user(user_id: int, username: Optional[str], full_name: Optional[str], referred_by: Optional[int] = None):
     u = q("SELECT user_id FROM users WHERE user_id=?", (user_id,), one=True)
     now_s = datetime.now(TZ).isoformat()
@@ -238,7 +271,7 @@ def ensure_user(user_id: int, username: Optional[str], full_name: Optional[str],
     else:
         q("UPDATE users SET username=?, full_name=? WHERE user_id=?", (clean_un, full_name or "", user_id), commit=True)
 
-def get_user(user_id: int) -> Optional[dict]:
+def get_user(user_id: int) -> Optional[sqlite3.Row]:
     return q("SELECT * FROM users WHERE user_id=?", (user_id,), one=True)
 
 # ==================== QORA RO'YXAT / FIRIBGARLAR ====================
@@ -271,7 +304,7 @@ def remove_from_blacklist(blacklist_id: int):
         q("UPDATE users SET is_banned=0 WHERE user_id=?", (row["user_id"],), commit=True)
     q("DELETE FROM blacklist WHERE id=?", (blacklist_id,), commit=True)
 
-def get_all_blacklisted(limit: int = 20) -> List[dict]:
+def get_all_blacklisted(limit: int = 20) -> List[sqlite3.Row]:
     return q("SELECT * FROM blacklist ORDER BY id DESC LIMIT ?", (limit,))
 
 # ==================== SAVDOLAR (DEALS) ====================
@@ -284,10 +317,10 @@ def create_deal(deal_id: str, buyer_id: int, buyer_username: str, seller_usernam
     """, (deal_id, buyer_id, buyer_username, seller_username, title, amount, fee, total_to_pay, mode, payment_id, now_s, now_s, now_s), commit=True)
     return deal_id
 
-def get_deal(deal_id: str) -> Optional[dict]:
+def get_deal(deal_id: str) -> Optional[sqlite3.Row]:
     return q("SELECT * FROM deals WHERE deal_id=?", (deal_id,), one=True)
 
-def get_active_deal_for_user(user_id: int) -> Optional[dict]:
+def get_active_deal_for_user(user_id: int) -> Optional[sqlite3.Row]:
     return q("SELECT * FROM deals WHERE buyer_id=? AND status IN ('created', 'waiting_payment', 'in_trade', 'goods_delivered', 'buyer_statement', 'seller_statement', 'buyer_confirmed', 'dispute') ORDER BY updated_at DESC LIMIT 1", (user_id,), one=True)
 
 def log_deal_message(deal_id: str, sender_id: int, sender_tag: str, role: str, text: str):
@@ -295,7 +328,7 @@ def log_deal_message(deal_id: str, sender_id: int, sender_tag: str, role: str, t
     q("INSERT INTO deal_messages (deal_id, sender_id, sender_tag, role, message_text, created_at) VALUES (?, ?, ?, ?, ?, ?)",
       (deal_id, sender_id, sender_tag, role, text, now_s), commit=True)
 
-def get_deal_messages(deal_id: str, limit: int = 50) -> List[dict]:
+def get_deal_messages(deal_id: str, limit: int = 50) -> List[sqlite3.Row]:
     return q("SELECT * FROM deal_messages WHERE deal_id=? ORDER BY id ASC LIMIT ?", (deal_id, limit))
 
 # ==================== PUL YECHISH (WITHDRAWALS) ====================
@@ -306,7 +339,7 @@ def create_withdrawal(user_id: int, amount: int, card_number: str, card_owner: s
     VALUES (?, ?, ?, ?, 'pending', ?)
     """, (user_id, amount, card_number, card_owner, now_s), commit=True)
 
-def get_pending_withdrawals(limit: int = 10) -> List[dict]:
+def get_pending_withdrawals(limit: int = 10) -> List[sqlite3.Row]:
     return q("SELECT * FROM withdrawals WHERE status='pending' ORDER BY created_at ASC LIMIT ?", (limit,))
 
 def complete_withdrawal(withdrawal_id: int) -> bool:
@@ -326,7 +359,7 @@ def create_complaint(deal_id: str = "", complainant_id: int = 0, complainant_use
     VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
     """, (deal_id or "", complainant_id, complainant_username or "", accused_id, accused_username or "", reason, deadline_s, now_s), commit=True)
 
-def get_user_complaints(user_id: int) -> List[dict]:
+def get_user_complaints(user_id: int) -> List[sqlite3.Row]:
     return q("SELECT * FROM complaints WHERE complainant_id=? ORDER BY id DESC", (user_id,))
 
 def withdraw_complaint(complaint_id: int) -> bool:
@@ -376,3 +409,28 @@ def import_user_backup_json(user_id: int, json_data: Any) -> Tuple[bool, int]:
     except Exception as e:
         logger.error(f"Backup import xatosi: {e}")
         return False, 0
+
+# ==================== FOYDALANUVCHI ULAGAN KANALLAR ====================
+def add_user_channel(user_id: int, channel_id: str, title: str, username: str, link: str) -> int:
+    now_s = datetime.now(TZ).isoformat()
+    return q("""
+    INSERT INTO user_channels (user_id, channel_id, channel_title, channel_username, channel_link, last_post_at, created_at, is_active)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+    ON CONFLICT(channel_id) DO UPDATE SET
+        user_id=excluded.user_id,
+        channel_title=excluded.channel_title,
+        channel_username=excluded.channel_username,
+        channel_link=excluded.channel_link,
+        is_active=1
+    """, (user_id, str(channel_id), title or "", username or "", link or "", now_s, now_s), commit=True)
+
+def get_user_channels(user_id: int) -> List[sqlite3.Row]:
+    return q("SELECT * FROM user_channels WHERE user_id=? AND is_active=1 ORDER BY id DESC", (user_id,))
+
+def get_active_user_channels() -> List[sqlite3.Row]:
+    return q("SELECT * FROM user_channels WHERE is_active=1")
+
+def update_channel_last_post(channel_id: str):
+    now_s = datetime.now(TZ).isoformat()
+    q("UPDATE user_channels SET last_post_at=?, total_posts=total_posts+1 WHERE channel_id=?", (now_s, str(channel_id)), commit=True)
+

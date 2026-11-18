@@ -195,6 +195,7 @@ class AdminFSM(StatesGroup):
     change_admin_user = State()
     change_proofs_channel = State()
     change_ad_photo = State()
+    change_ref_reward = State()
     ai_chat = State()
     reply_ticket_id = State()
     reply_ticket_text = State()
@@ -300,8 +301,9 @@ async def reward_referral_if_eligible(referred_id: int):
     if not is_sub:
         return
 
+    # 2. Telefon raqami tasdiqlangan bo'lishi shart
     u = db.get_user(referred_id)
-    if not u or not u["referred_by"]:
+    if not u or not u.get("phone_number") or not u.get("referred_by"):
         return
     ref_row = db.q("SELECT * FROM referrals WHERE referred_id=? AND status='pending'", (referred_id,), one=True)
     if not ref_row:
@@ -322,8 +324,11 @@ async def reward_referral_if_eligible(referred_id: int):
     else:
         extra_info = "Kanalingiz orqali yangi a'zo qo'shildi!"
 
+    # Admin belgilagan dinamik referal mukofoti:
+    ref_reward = int(db.get_setting("referral_reward_amount", "100"))
+
     now_s = datetime.now(TZ).isoformat()
-    db.q("UPDATE users SET referral_balance=referral_balance+100 WHERE user_id=?", (referrer_id,), commit=True)
+    db.q("UPDATE users SET referral_balance=referral_balance+? WHERE user_id=?", (ref_reward, referrer_id), commit=True)
     db.q("UPDATE referrals SET status='rewarded', updated_at=? WHERE id=?", (now_s, ref_row["id"]), commit=True)
 
     try:
@@ -331,8 +336,8 @@ async def reward_referral_if_eligible(referred_id: int):
             referrer_id,
             f"🎉 <b>YANGI REFERAL MUKOFOTI!</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Siz taklif qilgan foydalanuvchi (@{esc_html(u['username'] or str(referred_id))}) majburiy kanallarga to'liq a'zo bo'ldi.\n"
-            f"💰 Hisobingizga <b>+100 so'm</b> qo'shildi!\n"
+            f"Siz taklif qilgan foydalanuvchi (@{esc_html(u['username'] or str(referred_id))}) majburiy kanallarga a'zo bo'ldi va telefonini tasdiqladi.\n"
+            f"💰 Hisobingizga <b>+{fmt(ref_reward)} so'm</b> qo'shildi!\n"
             f"{extra_info}"
         )
     except Exception:
@@ -915,6 +920,25 @@ async def start_cmd(msg: Message, state: FSMContext):
         )
         return
 
+    # Telefon raqami tekshiruvi
+    u = db.get_user(uid)
+    if not u or not u["phone_number"]:
+        phone_kb = ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="📱 Telefon raqamni yuborish", request_contact=True)]],
+            resize_keyboard=True,
+            one_time_keyboard=True
+        )
+        await msg.answer(
+            f"📱 <b>TELEFON RAQAMINGIZNI TASDIQLANG</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Assalomu alaykum, <b>{esc_html(full_name)}</b>!\n\n"
+            f"Kafillik xizmati xavfsizligini ta'minlash va firibgarlikning oldini olish uchun "
+            f"telefon raqamingizni tasdiqlashingiz shart.\n\n"
+            f"👇 <i>Pastdagi '📱 Telefon raqamni yuborish' tugmasini bosing:</i>",
+            reply_markup=phone_kb
+        )
+        return
+
     await reward_referral_if_eligible(uid)
 
     # Qora ro'yxat tekshiruvi
@@ -927,6 +951,7 @@ async def start_cmd(msg: Message, state: FSMContext):
         )
         return
 
+    ref_reward_now = db.get_setting("referral_reward_amount", "100")
     text = (
         f"🛡 <b>KAFOLATLI SAVDO (ESCROW / GARANT) TIZIMI</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -935,7 +960,7 @@ async def start_cmd(msg: Message, state: FSMContext):
         f"💎 <b>BOT IMTIYOZLARI VA QULAYLIKLARI:</b>\n"
         f"├ 🎁 <b>1-savdongiz:</b> <b>MUTLAQO BEPUL (0% komissiya)</b>\n"
         f"├ 🤖 <b>AI Qorovul:</b> <b>Gemini 2.5 Flash intellekti nazoratida</b>\n"
-        f"├ 👥 <b>Referal tizimi:</b> <b>Do'stlaringiz uchun har safar +100 so'm</b>\n"
+        f"├ 👥 <b>Referal tizimi:</b> <b>Do'stlaringiz uchun har safar +{fmt(ref_reward_now)} so'm</b>\n"
         f"└ ⚡️ <b>Tezkor to'lovlar:</b> <b>TolovAPI.uz orqali to'liq avtomatlashgan</b>\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"👇 <b>Quyidagi menyudan kerakli bo'limni tanlang:</b>"
@@ -949,6 +974,29 @@ async def callback_check_sub(call: CallbackQuery):
     if not is_sub:
         await call.answer("⚠️ Hali barcha kanallarga a'zo bo'lmadingiz! Iltimos, ko'rsatilgan kanallarga a'zo bo'lib qayta bosing.", show_alert=True)
         return
+
+    u = db.get_user(uid)
+    if not u or not u["phone_number"]:
+        await call.answer("✅ Kanallarga obuna tasdiqlandi!", show_alert=False)
+        try:
+            await call.message.delete()
+        except Exception:
+            pass
+        phone_kb = ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="📱 Telefon raqamni yuborish", request_contact=True)]],
+            resize_keyboard=True,
+            one_time_keyboard=True
+        )
+        await call.message.answer(
+            f"📱 <b>TELEFON RAQAMINGIZNI TASDIQLANG</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Kanallarga muvaffaqiyatli a'zo bo'ldingiz!\n\n"
+            f"Kafillik xizmati xavfsizligini ta'minlash uchun telefon raqamingizni tasdiqlang.\n\n"
+            f"👇 <i>Pastdagi '📱 Telefon raqamni yuborish' tugmasini bosing:</i>",
+            reply_markup=phone_kb
+        )
+        return
+
     await call.answer("✅ Rahmat! Obuna tasdiqlandi.", show_alert=False)
     await reward_referral_if_eligible(uid)
     try:
@@ -957,6 +1005,31 @@ async def callback_check_sub(call: CallbackQuery):
         pass
     await call.message.answer(
         "🎉 <b>Obuna muvaffaqiyatli tasdiqlandi!</b>\nKafil botining barcha imkoniyatlaridan to'liq foydalanishingiz mumkin.",
+        reply_markup=main_menu_keyboard(uid)
+    )
+
+@router.message(F.contact)
+async def contact_handler(msg: Message, state: FSMContext):
+    await state.clear()
+    uid = msg.from_user.id
+    contact = msg.contact
+    if not contact:
+        return
+
+    phone = contact.phone_number
+    if not phone.startswith("+"):
+        phone = f"+{phone}"
+
+    db.update_user_phone(uid, phone)
+
+    is_sub, _ = await check_user_subscribed(uid)
+    if is_sub:
+        await reward_referral_if_eligible(uid)
+
+    await msg.answer(
+        f"✅ <b>TELEFON RAQAMINGIZ TASDIQLANDI!</b>\n"
+        f"📱 Raqam: <code>{phone}</code>\n\n"
+        f"Kafil botining barcha imkoniyatlaridan to'liq va xavfsiz foydalanishingiz mumkin.",
         reply_markup=main_menu_keyboard(uid)
     )
 
@@ -1423,6 +1496,7 @@ async def referral_menu_handler(msg: Message, state: FSMContext):
     uid = msg.from_user.id
     u = db.get_user(uid)
     ref_bal = u["referral_balance"] if u else 0
+    ref_reward = db.get_setting("referral_reward_amount", "100")
 
     text = (
         f"👥 <b>REFERAL DASTURI VA DAROMAD TIZIMI</b>\n"
@@ -1430,7 +1504,7 @@ async def referral_menu_handler(msg: Message, state: FSMContext):
         f"💰 <b>Sizning balansingiz:</b> <b>{fmt(ref_bal)} so'm</b>\n\n"
         f"Kerakli yo'nalishni tanlang:\n\n"
         f"1️⃣ <b>👤 Odam qo'shish (Botga):</b>\n"
-        f"Do'stlaringizga shaxsiy referal havolangizni tarqatib pul ishlang.\n\n"
+        f"Do'stlaringizga shaxsiy referal havolangizni tarqatib, har bir do'stingiz uchun <b>+{fmt(ref_reward)} so'm</b> ishlang.\n\n"
         f"2️⃣ <b>📢 Kanaldan botga odam qo'shish:</b>\n"
         f"O'z Telegram kanalingizga botni admin qilib ulang. Bot har 1 soatda sizning kanalingizga shaxsiy referal havolangiz bilan reklama posti yuborib turadi va kanalingiz a'zolaridan avtomatik daromad olasiz!\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1443,20 +1517,21 @@ async def referral_menu_handler(msg: Message, state: FSMContext):
     ]
     await msg.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
-@router.callback_query(F.data == "ref_back_main")
+@router.callback_query(StateFilter("*"), F.data == "ref_back_main")
 async def ref_back_main_cb(call: CallbackQuery, state: FSMContext):
     await call.answer()
     await state.clear()
     uid = call.from_user.id
     u = db.get_user(uid)
     ref_bal = u["referral_balance"] if u else 0
+    ref_reward = db.get_setting("referral_reward_amount", "100")
     text = (
         f"👥 <b>REFERAL DASTURI VA DAROMAD TIZIMI</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💰 <b>Sizning balansingiz:</b> <b>{fmt(ref_bal)} so'm</b>\n\n"
         f"Kerakli yo'nalishni tanlang:\n\n"
         f"1️⃣ <b>👤 Odam qo'shish (Botga):</b>\n"
-        f"Do'stlaringizga shaxsiy referal havolangizni tarqatib pul ishlang.\n\n"
+        f"Do'stlaringizga shaxsiy referal havolangizni tarqatib, har bir do'stingiz uchun <b>+{fmt(ref_reward)} so'm</b> ishlang.\n\n"
         f"2️⃣ <b>📢 Kanaldan botga odam qo'shish:</b>\n"
         f"O'z Telegram kanalingizga botni admin qilib ulang. Bot har 1 soatda sizning kanalingizga shaxsiy referal havolangiz bilan reklama posti yuborib turadi va kanalingiz a'zolaridan avtomatik daromad olasiz!\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1467,15 +1542,19 @@ async def ref_back_main_cb(call: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="📢 𝗞𝗮𝗻𝗮𝗹𝗱𝗮𝗻 𝗯𝗼𝘁𝗴𝗮 𝗼𝗱𝗮𝗺 𝗾𝗼'𝘀𝗵𝗶𝘀𝗵", callback_data="ref_mode_channel")],
         [InlineKeyboardButton(text="💸 𝗣𝘂𝗹𝗻𝗶 𝘆𝗲𝗰𝗵𝗶𝗯 𝗼𝗹𝗶𝘀𝗵", callback_data="ref_withdraw")]
     ]
-    await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    try:
+        await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    except Exception:
+        await call.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
-@router.callback_query(F.data == "ref_mode_bot")
+@router.callback_query(StateFilter("*"), F.data == "ref_mode_bot")
 async def ref_mode_bot_cb(call: CallbackQuery):
     await call.answer()
     uid = call.from_user.id
     u = db.get_user(uid)
     bot_info = await bot.get_me()
     ref_link = f"https://t.me/{bot_info.username}?start=ref_{uid}"
+    ref_reward = db.get_setting("referral_reward_amount", "100")
 
     today_prefix = datetime.now(TZ).strftime("%Y-%m-%d")
     today_count = db.q("SELECT COUNT(*) c FROM referrals WHERE referrer_id=? AND status='rewarded' AND created_at LIKE ?",
@@ -1491,7 +1570,7 @@ async def ref_mode_bot_cb(call: CallbackQuery):
         f"📊 <b>Bugun tasdiqlanganlar:</b> <b>{today_count}/20 ta</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📌 <b>REFERAL DASTURI SHARTLARI:</b>\n"
-        f"├ ➕ <b>Har bir do'st uchun:</b> <b>+100 so'm</b> (kanallarga a'zo bo'lgach)\n"
+        f"├ ➕ <b>Har bir do'st uchun:</b> <b>+{fmt(ref_reward)} so'm</b> (kanallarga a'zo bo'lgach va raqam tasdiqlangach)\n"
         f"├ 🛍 <b>Savdo mukofoti:</b> Taklif qilgan do'stingiz kamida <b>20 000 so'm</b>lik savdo qilsa — hisobingizga <b>+1 000 so'm</b> qo'shiladi!\n"
         f"├ ⚠️ <b>Jarima:</b> Do'stingiz kanallardan chiqib ketsa — hisobingizdan <b>-200 so'm</b> ayiriladi (balans manfiy bo'lishi mumkin)!\n"
         f"└ 💳 <b>Minimal yechish summasi:</b> <b>10 000 so'm</b>\n"
@@ -1505,9 +1584,12 @@ async def ref_mode_bot_cb(call: CallbackQuery):
         [InlineKeyboardButton(text="💸 𝗣𝘂𝗹𝗻𝗶 𝘆𝗲𝗰𝗵𝗶𝗯 𝗼𝗹𝗶𝘀𝗵", callback_data="ref_withdraw")],
         [InlineKeyboardButton(text="🔙 𝗢𝗿𝗾𝗮𝗴𝗮", callback_data="ref_back_main")]
     ]
-    await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    try:
+        await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    except Exception:
+        await call.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
-@router.callback_query(F.data == "ref_stats")
+@router.callback_query(StateFilter("*"), F.data == "ref_stats")
 async def ref_stats_callback(call: CallbackQuery):
     await call.answer()
     uid = call.from_user.id
@@ -1522,7 +1604,7 @@ async def ref_stats_callback(call: CallbackQuery):
         text += f"👤 ID: <code>{r['referred_id']}</code> | {st} ({date_s})\n"
     await call.message.answer(text)
 
-@router.callback_query(F.data == "ref_mode_channel")
+@router.callback_query(StateFilter("*"), F.data == "ref_mode_channel")
 async def ref_mode_channel_cb(call: CallbackQuery):
     await call.answer()
     uid = call.from_user.id
@@ -1530,6 +1612,7 @@ async def ref_mode_channel_cb(call: CallbackQuery):
     ref_bal = u["referral_balance"] if u else 0
     channels = db.get_user_channels(uid)
     interval_h = db.get_setting("channel_post_interval_hours", "1")
+    ref_reward = db.get_setting("referral_reward_amount", "100")
 
     text = (
         f"📢 <b>KANALDAN BOTGA ODAM QO'SHISH VA PUL ISHLASH</b>\n"
@@ -1537,7 +1620,7 @@ async def ref_mode_channel_cb(call: CallbackQuery):
         f"Siz bu bo'lim orqali o'z kanalingizga botni admin qilib qo'shasiz va kanalingiz havolasini yuborasiz.\n\n"
         f"Biz botimiz orqali <b>har {interval_h} soatda</b> sizning kanalingizga referal havolangiz bilan chiroyli reklama posti yuborib turamiz!\n\n"
         f"💰 <b>DAROMAD VA SHARTLAR:</b>\n"
-        f"├ ➕ <b>Har bir a'zo uchun:</b> <b>+100 so'm</b> (majburiy kanallarga a'zo bo'lgach qo'shiladi)\n"
+        f"├ ➕ <b>Har bir a'zo uchun:</b> <b>+{fmt(ref_reward)} so'm</b> (majburiy kanallarga a'zo bo'lgach va raqam tasdiqlangach qo'shiladi)\n"
         f"├ 🛍 <b>Savdo qilganda:</b> Kirgan odam kamida <b>20 000 so'm</b>lik savdo qilsa va botga pul tushsa — sizga <b>+1 000 so'm</b> beriladi (20 000 dan kam savdoga berilmaydi)!\n"
         f"└ ⚠️ <b>Jarima:</b> Agar kirgan a'zo majburiy kanallardan chiqib ketsa — hisobingizdan <b>-200 so'm</b> ayiriladi (balans 0 bo'lsa, -200 bo'lib qoladi)!\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1551,9 +1634,12 @@ async def ref_mode_channel_cb(call: CallbackQuery):
         [InlineKeyboardButton(text="💸 𝗣𝘂𝗹𝗻𝗶 𝘆𝗲𝗰𝗵𝗶𝗯 𝗼𝗹𝗶𝘀𝗵", callback_data="ref_withdraw")],
         [InlineKeyboardButton(text="🔙 𝗢𝗿𝗾𝗮𝗴𝗮", callback_data="ref_back_main")]
     ]
-    await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    try:
+        await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    except Exception:
+        await call.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
-@router.callback_query(F.data == "ref_add_channel")
+@router.callback_query(StateFilter("*"), F.data == "ref_add_channel")
 async def ref_add_channel_start(call: CallbackQuery, state: FSMContext):
     await call.answer()
     await state.set_state(ConnectChannelFSM.channel_link)
@@ -1629,6 +1715,7 @@ async def proc_connect_channel(msg: Message, state: FSMContext):
             logger.warning(f"Dastlabki post yuborishda xato: {exc}")
 
         await state.clear()
+        ref_reward_c = db.get_setting("referral_reward_amount", "100")
         await msg.answer(
             f"🎉 <b>KANALINGIZ MUVAFFAQIYATLI ULANDI!</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1637,7 +1724,7 @@ async def proc_connect_channel(msg: Message, state: FSMContext):
             f"🆔 <b>Kanal ID:</b> <code>{ch_id}</code>\n\n"
             f"✅ Kanalingizga birinchi reklama posti muvaffaqiyatli yuborildi!\n"
             f"⏰ Bot har 1 soatda avtomatik ravishda kanalingizga sizning referal havolangiz bilan post joylab boradi.\n\n"
-            f"💰 Kanalingizdan kirgan har bir a'zo uchun +100 so'm, savdo qilganlar uchun esa +1 000 so'mdan hisobingizga qo'shiladi!",
+            f"💰 Kanalingizdan kirgan har bir a'zo uchun +{fmt(ref_reward_c)} so'm, savdo qilganlar uchun esa +1 000 so'mdan hisobingizga qo'shiladi!",
             reply_markup=main_menu_keyboard(msg.from_user.id)
         )
     except Exception as e:
@@ -1647,7 +1734,7 @@ async def proc_connect_channel(msg: Message, state: FSMContext):
             f"Iltimos, bot kanalga admin qilib qo'shilganini va havola to'g'riligini tekshirib qaytadan yuboring."
         )
 
-@router.callback_query(F.data == "ref_my_channels")
+@router.callback_query(StateFilter("*"), F.data == "ref_my_channels")
 async def ref_my_channels_cb(call: CallbackQuery):
     await call.answer()
     uid = call.from_user.id
@@ -1692,9 +1779,12 @@ async def ref_my_channels_cb(call: CallbackQuery):
         [InlineKeyboardButton(text="💸 𝗣𝘂𝗹𝗻𝗶 𝘆𝗲𝗰𝗵𝗶𝗯 𝗼𝗹𝗶𝘀𝗵", callback_data="ref_withdraw")],
         [InlineKeyboardButton(text="🔙 𝗢𝗿𝗾𝗮𝗴𝗮", callback_data="ref_mode_channel")]
     ]
-    await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    try:
+        await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    except Exception:
+        await call.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
-@router.callback_query(F.data == "ref_withdraw")
+@router.callback_query(StateFilter("*"), F.data == "ref_withdraw")
 async def ref_withdraw_start(call: CallbackQuery, state: FSMContext):
     await call.answer()
     uid = call.from_user.id
@@ -2761,6 +2851,7 @@ async def admin_panel_handler(msg: Message, state: FSMContext):
     card = db.get_setting("card_number", DEFAULT_CARD_NUMBER)
     owner = db.get_setting("card_owner", DEFAULT_CARD_OWNER)
     comm = db.get_setting("commission_percent", "10")
+    ref_reward = db.get_setting("referral_reward_amount", "100")
 
     admin_u = db.get_setting("admin_username", "")
     admin_id_s = db.get_setting("admin_id", "")
@@ -2794,7 +2885,8 @@ async def admin_panel_handler(msg: Message, state: FSMContext):
         f"💳 <b>MOLIYAVIY SOZLAMALAR:</b>\n"
         f"├ 💳 <b>Kafil to'lov kartasi:</b> <code>{format_card(card)}</code>\n"
         f"├ 👤 <b>Karta egasi:</b> <b>{owner}</b>\n"
-        f"└ 💼 <b>Kafil komissiyasi:</b> <b>{comm}%</b>\n"
+        f"├ 💼 <b>Kafil komissiyasi:</b> <b>{comm}%</b>\n"
+        f"└ 🎁 <b>Referal mukofoti:</b> <b>{fmt(ref_reward)} so'm</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"⚙️ <b>Kerakli boshqaruv bo'limini tanlang:</b>"
     )
@@ -2809,8 +2901,9 @@ async def admin_panel_handler(msg: Message, state: FSMContext):
          InlineKeyboardButton(text="💸 𝗥𝗲𝗳𝗲𝗿𝗮𝗹 𝘀𝗼'𝗿𝗼𝘃𝗹𝗮𝗿𝗶", callback_data="adm_withdrawals")],
         [InlineKeyboardButton(text="💳 𝗞𝗮𝗿𝘁𝗮 𝘀𝗼𝘇𝗹𝗮𝘀𝗵", callback_data="adm_edit_card"),
          InlineKeyboardButton(text="💼 𝗞𝗼𝗺𝗶𝘀𝘀𝗶𝘆𝗮 𝘀𝗼𝘇𝗹𝗮𝘀𝗵", callback_data="adm_edit_pct")],
-        [InlineKeyboardButton(text="👤 𝗔𝗱𝗺𝗶𝗻 𝘂𝘀𝗲𝗿 𝗮𝗹𝗺𝗮𝘀𝗵𝘁𝗶𝗿𝗶𝘀𝗵", callback_data="adm_edit_admin_user"),
-         InlineKeyboardButton(text="📢 𝗜𝘀𝗯𝗼𝘁𝗹𝗮𝗿 𝗸𝗮𝗻𝗮𝗹𝗶", callback_data="adm_edit_proofs_channel")]
+        [InlineKeyboardButton(text="🎁 𝗥𝗲𝗳𝗲𝗿𝗮𝗹 𝘀𝘂𝗺𝗺𝗮𝘀𝗶", callback_data="adm_edit_ref_reward"),
+         InlineKeyboardButton(text="📢 𝗜𝘀𝗯𝗼𝘁𝗹𝗮𝗿 𝗸𝗮𝗻𝗮𝗹𝗶", callback_data="adm_edit_proofs_channel")],
+        [InlineKeyboardButton(text="👤 𝗔𝗱𝗺𝗶𝗻 𝘂𝘀𝗲𝗿 𝗮𝗹𝗺𝗮𝘀𝗵𝘁𝗶𝗿𝗶𝘀𝗵", callback_data="adm_edit_admin_user")]
     ]
     admin_video_id = "BAACAgEAAxkBAAEwpF1q_d4QPpxhtyv6sMqMKTNYM-9vKQAC8AQAApD_uUVGP4KdaHkpDz0E"
     try:
@@ -2823,7 +2916,7 @@ async def admin_panel_handler(msg: Message, state: FSMContext):
         logger.warning(f"Admin panel video yuborishda xato: {e}")
         await msg.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
-@router.callback_query(F.data == "adm_view_deals")
+@router.callback_query(StateFilter("*"), F.data == "adm_view_deals")
 async def adm_view_deals_cb(call: CallbackQuery):
     await call.answer()
     deals = db.q("SELECT * FROM deals ORDER BY updated_at DESC LIMIT 10")
@@ -2835,7 +2928,7 @@ async def adm_view_deals_cb(call: CallbackQuery):
         text += f"🆔 <b>#{d['deal_id']}</b> | {d['status']} | <b>{fmt(d['amount'])} so'm</b>\n"
     await call.message.answer(text)
 
-@router.callback_query(F.data == "adm_view_scammers")
+@router.callback_query(StateFilter("*"), F.data == "adm_view_scammers")
 async def adm_view_scammers_cb(call: CallbackQuery):
     await call.answer()
     kb = [
@@ -2885,7 +2978,7 @@ async def adm_list_scammers_cb(call: CallbackQuery):
         text += f"ID: <code>{r['user_id']}</code> | @{r['username']} | <i>{r['reason']}</i>\n"
     await call.message.answer(text)
 
-@router.callback_query(F.data == "adm_broadcast")
+@router.callback_query(StateFilter("*"), F.data == "adm_broadcast")
 async def adm_broadcast_start(call: CallbackQuery):
     await call.answer()
     kb = [
@@ -2962,7 +3055,7 @@ async def adm_proc_broadcast_channels(msg: Message, state: FSMContext):
             logger.warning(f"Kanalga broadcast xatosi ({ch['channel_id']}): {e}")
     await prog.edit_text(f"✅ Kanallarga tarqatish yakunlandi!\nYetkazildi: {sent} ta\nYetib bormadi: {failed} ta")
 
-@router.callback_query(F.data == "adm_edit_ad_photo")
+@router.callback_query(StateFilter("*"), F.data == "adm_edit_ad_photo")
 async def adm_edit_ad_photo_cb(call: CallbackQuery, state: FSMContext):
     if not is_admin(call.from_user.id):
         await call.answer("Ruxsat berilmagan!", show_alert=True)
@@ -3002,7 +3095,7 @@ async def adm_proc_change_ad_photo(msg: Message, state: FSMContext):
     await state.clear()
     await msg.answer("✅ Reklama rasmi muvaffaqiyatli saqlandi! Endi barcha kanallarga ushbu rasm bilan xabar yuboriladi.", reply_markup=main_menu_keyboard(msg.from_user.id))
 
-@router.callback_query(F.data == "adm_view_user_channels")
+@router.callback_query(StateFilter("*"), F.data == "adm_view_user_channels")
 async def adm_view_user_channels_cb(call: CallbackQuery):
     await call.answer()
     channels = db.q("""
@@ -3031,7 +3124,7 @@ async def adm_view_user_channels_cb(call: CallbackQuery):
         )
     await call.message.answer(text)
 
-@router.callback_query(F.data == "adm_channels")
+@router.callback_query(StateFilter("*"), F.data == "adm_channels")
 async def adm_channels_menu(call: CallbackQuery):
     await call.answer()
     channels = db.q("SELECT * FROM mandatory_channels")
@@ -3248,13 +3341,13 @@ async def adm_paid_seller_cb(call: CallbackQuery):
     except Exception:
         pass
 
-@router.callback_query(F.data == "adm_ai_chat")
+@router.callback_query(StateFilter("*"), F.data == "adm_ai_chat")
 async def adm_ai_chat_report(call: CallbackQuery):
     await call.answer()
     report = await analyze_deals_for_admin()
     await call.message.answer(report)
 
-@router.callback_query(F.data == "adm_withdrawals")
+@router.callback_query(StateFilter("*"), F.data == "adm_withdrawals")
 async def adm_withdrawals_cb(call: CallbackQuery):
     await call.answer()
     rows = db.q("SELECT * FROM withdrawals WHERE status='pending' ORDER BY created_at ASC LIMIT 10")
@@ -3324,7 +3417,7 @@ async def adm_proc_ticket_reply(msg: Message, state: FSMContext):
         except Exception as e:
             await msg.answer(f"Yetkazishda xatolik: {e}")
 
-@router.callback_query(F.data == "adm_edit_card")
+@router.callback_query(StateFilter("*"), F.data == "adm_edit_card")
 async def adm_edit_card_start(call: CallbackQuery, state: FSMContext):
     await call.answer()
     await state.set_state(AdminFSM.change_card)
@@ -3346,7 +3439,7 @@ async def adm_proc_new_owner(msg: Message, state: FSMContext):
     db.set_setting("card_owner", owner)
     await msg.answer(f"✅ Karta yangilandi:\n<code>{format_card(data['new_card'])}</code> ({owner})")
 
-@router.callback_query(F.data == "adm_edit_pct")
+@router.callback_query(StateFilter("*"), F.data == "adm_edit_pct")
 async def adm_edit_pct_start(call: CallbackQuery, state: FSMContext):
     await call.answer()
     await state.set_state(AdminFSM.change_commission)
@@ -3362,7 +3455,44 @@ async def adm_proc_new_pct(msg: Message, state: FSMContext):
     await state.clear()
     await msg.answer(f"✅ Komissiya foizi {txt}% ga o'zgartirildi.")
 
-@router.callback_query(F.data == "adm_edit_admin_user")
+@router.callback_query(StateFilter("*"), F.data == "adm_edit_ref_reward")
+async def adm_edit_ref_reward_cb(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        await call.answer("Ruxsat berilmagan!", show_alert=True)
+        return
+    await call.answer()
+    await state.set_state(AdminFSM.change_ref_reward)
+    curr_rew = db.get_setting("referral_reward_amount", "100")
+    await call.message.answer(
+        f"🎁 <b>REFERAL MUKOFOTI SUMMASINI O'ZGARTIRISH:</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Hozirgi mukofot summasi: <b>{fmt(curr_rew)} so'm</b> (har bir yangi tasdiqlangan foydalanuvchi uchun).\n\n"
+        f"Yangi summani so'mda kiriting (masalan: <code>150</code> yoki <code>200</code>):",
+        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Bekor qilish")]], resize_keyboard=True)
+    )
+
+@router.message(AdminFSM.change_ref_reward)
+async def adm_proc_change_ref_reward(msg: Message, state: FSMContext):
+    if any(w in (msg.text or "").lower() for w in ["bekor", "cancel"]) or (msg.text and msg.text.startswith("❌")):
+        await state.clear()
+        await msg.answer("Bekor qilindi.", reply_markup=main_menu_keyboard(msg.from_user.id))
+        return
+
+    txt = (msg.text or "").strip()
+    if not txt.isdigit() or int(txt) <= 0:
+        await msg.answer("Iltimos, musbat butun son kiriting (masalan: 100 yoki 200):")
+        return
+
+    new_val = int(txt)
+    db.set_setting("referral_reward_amount", str(new_val))
+    await state.clear()
+    await msg.answer(
+        f"✅ <b>Referal mukofoti muvaffaqiyatli yangilandi!</b>\n\n"
+        f"Endi har bir yangi referal uchun <b>{fmt(new_val)} so'm</b> mukofot beriladi.",
+        reply_markup=main_menu_keyboard(msg.from_user.id)
+    )
+
+@router.callback_query(StateFilter("*"), F.data == "adm_edit_admin_user")
 async def adm_edit_admin_user_cb(call: CallbackQuery, state: FSMContext):
     if not is_admin(call.from_user.id):
         await call.answer("Ruxsat berilmagan!", show_alert=True)
@@ -3414,7 +3544,7 @@ async def adm_proc_change_admin_user(msg: Message, state: FSMContext):
         reply_markup=main_menu_keyboard(msg.from_user.id)
     )
 
-@router.callback_query(F.data == "adm_edit_proofs_channel")
+@router.callback_query(StateFilter("*"), F.data == "adm_edit_proofs_channel")
 async def adm_edit_proofs_channel_cb(call: CallbackQuery, state: FSMContext):
     if not is_admin(call.from_user.id):
         await call.answer("Ruxsat berilmagan!", show_alert=True)
