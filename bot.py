@@ -170,14 +170,20 @@ class SOSFSM(StatesGroup):
     deal_complaint_reason = State()
 
 class WithdrawFSM(StatesGroup):
+    amount = State()
+    anketa = State()
     card_number = State()
     card_owner = State()
+
+class ConnectChannelFSM(StatesGroup):
+    channel_link = State()
 
 class BackupFSM(StatesGroup):
     upload_file = State()
 
 class AdminFSM(StatesGroup):
     broadcast = State()
+    broadcast_channels = State()
     add_black_user = State()
     add_black_reason = State()
     add_channel_id = State()
@@ -188,6 +194,7 @@ class AdminFSM(StatesGroup):
     change_commission = State()
     change_admin_user = State()
     change_proofs_channel = State()
+    change_ad_photo = State()
     ai_chat = State()
     reply_ticket_id = State()
     reply_ticket_text = State()
@@ -288,6 +295,11 @@ async def check_user_subscribed(user_id: int) -> Tuple[bool, List[dict]]:
     return (len(unsubscribed) == 0), unsubscribed
 
 async def reward_referral_if_eligible(referred_id: int):
+    # 1. Foydalanuvchi majburiy kanallarga a'zo bo'lganini qat'iy tekshirish
+    is_sub, _ = await check_user_subscribed(referred_id)
+    if not is_sub:
+        return
+
     u = db.get_user(referred_id)
     if not u or not u["referred_by"]:
         return
@@ -296,25 +308,32 @@ async def reward_referral_if_eligible(referred_id: int):
         return
 
     referrer_id = u["referred_by"]
-    today_prefix = datetime.now(TZ).strftime("%Y-%m-%d")
-    today_count = db.q("SELECT COUNT(*) c FROM referrals WHERE referrer_id=? AND status='rewarded' AND created_at LIKE ?",
-                       (referrer_id, f"{today_prefix}%"), one=True)["c"]
+    source_ch = ref_row.get("source_channel_id")
 
-    if today_count >= 20:
-        logger.info(f"Referrer {referrer_id} kunlik 20 ta limitga yetgan.")
-        return
+    # Agar kanaldan bo'lmasa, kunlik 20 ta limitni tekshirish
+    if not source_ch:
+        today_prefix = datetime.now(TZ).strftime("%Y-%m-%d")
+        today_count = db.q("SELECT COUNT(*) c FROM referrals WHERE referrer_id=? AND status='rewarded' AND created_at LIKE ?",
+                           (referrer_id, f"{today_prefix}%"), one=True)["c"]
+        if today_count >= 20:
+            logger.info(f"Referrer {referrer_id} kunlik 20 ta limitga yetgan.")
+            return
+        extra_info = f"Bugun qo'shgan do'stlaringiz: <b>{today_count + 1}/20 ta</b>"
+    else:
+        extra_info = "Kanalingiz orqali yangi a'zo qo'shildi!"
 
+    now_s = datetime.now(TZ).isoformat()
     db.q("UPDATE users SET referral_balance=referral_balance+100 WHERE user_id=?", (referrer_id,), commit=True)
-    db.q("UPDATE referrals SET status='rewarded' WHERE id=?", (ref_row["id"],), commit=True)
+    db.q("UPDATE referrals SET status='rewarded', updated_at=? WHERE id=?", (now_s, ref_row["id"]), commit=True)
 
     try:
         await bot.send_message(
             referrer_id,
             f"🎉 <b>YANGI REFERAL MUKOFOTI!</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Siz taklif qilgan foydalanuvchi (@{esc_html(u['username'] or str(referred_id))}) botdan to'liq ro'yxatdan o'tdi.\n"
+            f"Siz taklif qilgan foydalanuvchi (@{esc_html(u['username'] or str(referred_id))}) majburiy kanallarga to'liq a'zo bo'ldi.\n"
             f"💰 Hisobingizga <b>+100 so'm</b> qo'shildi!\n"
-            f"Bugun qo'shgan do'stlaringiz: <b>{today_count + 1}/20 ta</b>"
+            f"{extra_info}"
         )
     except Exception:
         pass
@@ -328,9 +347,10 @@ async def penalize_referral_if_left(user_id: int):
     if not referrer:
         return
 
+    now_s = datetime.now(TZ).isoformat()
     new_bal = referrer["referral_balance"] - 200
     db.q("UPDATE users SET referral_balance=? WHERE user_id=?", (new_bal, referrer_id), commit=True)
-    db.q("UPDATE referrals SET status='penalized' WHERE id=?", (ref["id"],), commit=True)
+    db.q("UPDATE referrals SET status='penalized', updated_at=? WHERE id=?", (now_s, ref["id"]), commit=True)
 
     try:
         left_u = db.get_user(user_id)
@@ -366,6 +386,58 @@ def mask_name_for_proof(name_str: str) -> str:
         else:
             masked.append(p[0].upper() + "*" * (len(p) - 1))
     return " ".join(masked)
+
+def parse_withdrawal_anketa(text: str) -> Tuple[bool, str, str, str]:
+    """Foydalanuvchi yuborgan karta va ism anketasini tekshirish."""
+    lines = [l.strip() for l in (text or "").split("\n") if l.strip()]
+
+    # 1. Karta raqamini qidirish:
+    card_num = ""
+    for l in lines:
+        if any(k in l.lower() for k in ["karta", "raqam"]):
+            clean_l = re.sub(r"(?i)^(1\s*[\.\):-]?\s*)?(karta\s*raqam[i]?|karta|raqam[i]?)\s*[:=-]?\s*", "", l).strip()
+            digits_in_line = re.sub(r"\D", "", clean_l)
+            if len(digits_in_line) == 16:
+                card_num = digits_in_line
+                break
+
+    if not card_num:
+        match = re.search(r"(?:(?:\b|(?<=\D)))(8600|9860|5614|6262|4\d{3}|5\d{3})(?:[\s-]*)(\d{4})(?:[\s-]*)(\d{4})(?:[\s-]*)(\d{4})(?=\D|\b)", text or "")
+        if match:
+            card_num = "".join(match.groups())
+
+    if not card_num:
+        match_any = re.search(r"(?:(?:\b|(?<=\D)))(\d{4})(?:[\s-]*)(\d{4})(?:[\s-]*)(\d{4})(?:[\s-]*)(\d{4})(?=\D|\b)", text or "")
+        if match_any:
+            card_num = "".join(match_any.groups())
+
+    # 2. Karta egasi:
+    owner = ""
+    for l in lines:
+        lower_l = l.lower()
+        if any(k in lower_l for k in ["karta egasi", "egasi", "ism", "familiya", "nomi"]):
+            clean = re.sub(r"(?i)^(2\s*[\.\):-]?\s*)?(karta\s*egasi|ism\s*familiya|egasi|ism|familiya|karta\s*nomi)\s*[:=-]?\s*", "", l).strip()
+            clean_name = re.sub(r"[0-9#@_\*]", "", clean).strip()
+            parts = clean_name.split()
+            if len(parts) >= 2 and all(len(p) >= 2 for p in parts):
+                owner = " ".join(parts[:3]).upper()
+                break
+
+    if not owner:
+        for l in lines:
+            if not re.search(r"\d{10,}", l):
+                words = [w for w in re.findall(r"[a-zA-ZА-Яа-яЎўҚқҒғҲҳʻʼ']+", l) if w.lower() not in ["karta", "raqam", "egasi", "ism", "familiya", "id", "shablon", "anketa"]]
+                if len(words) >= 2 and all(len(w) >= 2 for w in words):
+                    owner = f"{words[0]} {words[1]}".upper()
+                    break
+
+    if not card_num or len(card_num) != 16:
+        return False, "❌ <b>16 xonali karta raqami topilmadi yoki noto'g'ri!</b>\nIltimos, 16 xonali karta raqamingizni to'liq yozing (masalan: 8600 0000 0000 0000).", "", ""
+
+    if not owner or len(owner.split()) < 2:
+        return False, "❌ <b>Karta egasining Ism va Familiyasi to'liq yozilmadi!</b>\nIltimos, kamida 2 ta so'zdan iborat Ism va Familiyangizni to'liq kiriting (masalan: ALIYEV VALI).", "", ""
+
+    return True, "", card_num, owner
 
 async def post_deal_receipt_to_proofs_channel(deal: dict, now_str: str):
     cid = db.get_setting("proofs_channel_id", "")
@@ -505,6 +577,27 @@ async def activate_paid_deal(deal_id: str, edit_call: Optional[CallbackQuery] = 
             )
         except Exception:
             pass
+
+    # Taklif qilgan foydalanuvchiga savdo mukofoti (kamida 20 000 so'mlik savdoga 1000 so'm):
+    deal_amt = deal.get("amount", 0)
+    if deal_amt >= 20000:
+        ref_row = db.q("SELECT * FROM referrals WHERE referred_id=? AND deal_reward_given=0", (buyer_id,), one=True)
+        if ref_row:
+            referrer_id = ref_row["referrer_id"]
+            now_s = datetime.now(TZ).isoformat()
+            db.q("UPDATE users SET referral_balance=referral_balance+1000 WHERE user_id=?", (referrer_id,), commit=True)
+            db.q("UPDATE referrals SET deal_reward_given=1, updated_at=? WHERE id=?", (now_s, ref_row["id"]), commit=True)
+            try:
+                await bot.send_message(
+                    referrer_id,
+                    f"🎉 <b>REFERAL SAVDO MUKOFOTI: +1 000 so'm!</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"Siz taklif qilgan a'zo #{d_id} raqamli savdo uchun <b>{fmt(deal_amt)} so'm</b> to'lov qildi!\n"
+                    f"💰 Hisobingizga <b>+1 000 so'm</b> mukofot qo'shildi!"
+                )
+            except Exception:
+                pass
+
     return True
 
 async def deal_auto_payment_watcher(deal_id: str):
@@ -665,6 +758,62 @@ async def referral_leave_checker_loop():
         except Exception as e:
             logger.error(f"referral checker loop xatosi: {e}")
 
+async def channel_autopost_loop():
+    """Ulangan kanallarga har 1 soatda avtomatik reklama va referal havolasini yuboruvchi loop."""
+    while True:
+        try:
+            await asyncio.sleep(60)
+            interval_hours = float(db.get_setting("channel_post_interval_hours", "1"))
+            interval_secs = int(interval_hours * 3600)
+
+            active_channels = db.get_active_user_channels()
+            now = datetime.now(TZ)
+            bot_info = await bot.get_me()
+            bot_un = bot_info.username or "KafilBot"
+            ad_photo = db.get_setting("channel_ad_photo", "")
+
+            for ch in active_channels:
+                cid = ch["channel_id"]
+                owner_id = ch["user_id"]
+                last_s = ch["last_post_at"]
+                should_post = False
+                if not last_s:
+                    should_post = True
+                else:
+                    try:
+                        last_dt = datetime.fromisoformat(last_s)
+                        if (now - last_dt).total_seconds() >= interval_secs:
+                            should_post = True
+                    except Exception:
+                        should_post = True
+
+                if should_post:
+                    ref_link = f"https://t.me/{bot_un}?start=ref_{owner_id}"
+                    post_text = (
+                        f"🛡 <b>XAVFSIZ VA ISHONCHLI SAVDO (GARANT) BOTI!</b>\n\n"
+                        f"Ushbu bot orqali begona odamlar bilan har qanday savdolarni (akkaunt, kanal, xizmatlar) "
+                        f"100% ishonchli va xavfsiz amalga oshirishingiz mumkin!\n\n"
+                        f"💰 Shuningdek, botga do'stlaringizni taklif qilib, har bir a'zo uchun pul ishlashingiz mumkin.\n\n"
+                        f"👇 <b>Botni ishga tushirish uchun bosing:</b>\n"
+                        f"{ref_link}"
+                    )
+                    kb = InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="🚀 Botga kirish va pul ishlash", url=ref_link)]
+                    ])
+                    target_cid = int(cid) if str(cid).lstrip("-").isdigit() else cid
+                    try:
+                        if ad_photo:
+                            await bot.send_photo(target_cid, photo=ad_photo, caption=post_text, reply_markup=kb)
+                        else:
+                            await bot.send_message(target_cid, text=post_text, reply_markup=kb)
+                        db.update_channel_last_post(cid)
+                    except Exception as e:
+                        logger.warning(f"Kanalga avtopost xatosi ({cid}): {e}")
+                        if any(err in str(e).lower() for err in ["chat not found", "forbidden", "bot was kicked", "not an administrator"]):
+                            db.q("UPDATE user_channels SET is_active=0 WHERE channel_id=?", (cid,), commit=True)
+        except Exception as exc:
+            logger.error(f"channel_autopost_loop xatosi: {exc}")
+
 # ============================ 7. BUYRUQLAR VA BEKOR QILISH ============================
 @router.message(StateFilter("*"), Command("cancel"))
 @router.message(StateFilter("*"), F.text.contains("Bekor") | F.text.contains("𝗕𝗲𝗸𝗼𝗿") | F.text.startswith("❌"))
@@ -693,14 +842,29 @@ async def start_cmd(msg: Message, state: FSMContext):
     args = msg.text.split(maxsplit=1)[1] if len(msg.text.split()) > 1 else ""
     referred_by = None
 
+    source_ch_id = None
     if args.startswith("ref_"):
         ref_raw = args.replace("ref_", "").strip()
         if ref_raw.isdigit() and int(ref_raw) != uid:
             referred_by = int(ref_raw)
-            exists = db.q("SELECT id FROM referrals WHERE referred_id=?", (uid,), one=True)
-            if not exists:
-                db.q("INSERT INTO referrals (referrer_id, referred_id, status, created_at) VALUES (?, ?, 'pending', ?)",
-                     (referred_by, uid, datetime.now(TZ).isoformat()), commit=True)
+    elif args.startswith("ch_"):
+        parts = args.split("_")
+        if len(parts) >= 3 and parts[-1].isdigit():
+            r_id = int(parts[-1])
+            if r_id != uid:
+                referred_by = r_id
+                source_ch_id = "_".join(parts[1:-1])
+
+    if referred_by:
+        if not source_ch_id:
+            user_ch = db.q("SELECT channel_id FROM user_channels WHERE user_id=? AND is_active=1 LIMIT 1", (referred_by,), one=True)
+            if user_ch:
+                source_ch_id = user_ch["channel_id"]
+
+        exists = db.q("SELECT id FROM referrals WHERE referred_id=?", (uid,), one=True)
+        if not exists:
+            db.q("INSERT INTO referrals (referrer_id, referred_id, source_channel_id, status, created_at) VALUES (?, ?, ?, 'pending', ?)",
+                 (referred_by, uid, source_ch_id, datetime.now(TZ).isoformat()), commit=True)
 
     db.ensure_user(uid, username, full_name, referred_by)
 
@@ -1258,6 +1422,58 @@ async def referral_menu_handler(msg: Message, state: FSMContext):
     await state.clear()
     uid = msg.from_user.id
     u = db.get_user(uid)
+    ref_bal = u["referral_balance"] if u else 0
+
+    text = (
+        f"👥 <b>REFERAL DASTURI VA DAROMAD TIZIMI</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 <b>Sizning balansingiz:</b> <b>{fmt(ref_bal)} so'm</b>\n\n"
+        f"Kerakli yo'nalishni tanlang:\n\n"
+        f"1️⃣ <b>👤 Odam qo'shish (Botga):</b>\n"
+        f"Do'stlaringizga shaxsiy referal havolangizni tarqatib pul ishlang.\n\n"
+        f"2️⃣ <b>📢 Kanaldan botga odam qo'shish:</b>\n"
+        f"O'z Telegram kanalingizga botni admin qilib ulang. Bot har 1 soatda sizning kanalingizga shaxsiy referal havolangiz bilan reklama posti yuborib turadi va kanalingiz a'zolaridan avtomatik daromad olasiz!\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👇 <i>Davom etish uchun quyidagi bo'limlardan birini tanlang:</i>"
+    )
+    kb = [
+        [InlineKeyboardButton(text="👤 𝗢𝗱𝗮𝗺 𝗾𝗼'𝘀𝗵𝗶𝘀𝗵 (𝗕𝗼𝘁𝗴𝗮)", callback_data="ref_mode_bot")],
+        [InlineKeyboardButton(text="📢 𝗞𝗮𝗻𝗮𝗹𝗱𝗮𝗻 𝗯𝗼𝘁𝗴𝗮 𝗼𝗱𝗮𝗺 𝗾𝗼'𝘀𝗵𝗶𝘀𝗵", callback_data="ref_mode_channel")],
+        [InlineKeyboardButton(text="💸 𝗣𝘂𝗹𝗻𝗶 𝘆𝗲𝗰𝗵𝗶𝗯 𝗼𝗹𝗶𝘀𝗵", callback_data="ref_withdraw")]
+    ]
+    await msg.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+@router.callback_query(F.data == "ref_back_main")
+async def ref_back_main_cb(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    await state.clear()
+    uid = call.from_user.id
+    u = db.get_user(uid)
+    ref_bal = u["referral_balance"] if u else 0
+    text = (
+        f"👥 <b>REFERAL DASTURI VA DAROMAD TIZIMI</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 <b>Sizning balansingiz:</b> <b>{fmt(ref_bal)} so'm</b>\n\n"
+        f"Kerakli yo'nalishni tanlang:\n\n"
+        f"1️⃣ <b>👤 Odam qo'shish (Botga):</b>\n"
+        f"Do'stlaringizga shaxsiy referal havolangizni tarqatib pul ishlang.\n\n"
+        f"2️⃣ <b>📢 Kanaldan botga odam qo'shish:</b>\n"
+        f"O'z Telegram kanalingizga botni admin qilib ulang. Bot har 1 soatda sizning kanalingizga shaxsiy referal havolangiz bilan reklama posti yuborib turadi va kanalingiz a'zolaridan avtomatik daromad olasiz!\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👇 <i>Davom etish uchun quyidagi bo'limlardan birini tanlang:</i>"
+    )
+    kb = [
+        [InlineKeyboardButton(text="👤 𝗢𝗱𝗮𝗺 𝗾𝗼'𝘀𝗵𝗶𝘀𝗵 (𝗕𝗼𝘁𝗴𝗮)", callback_data="ref_mode_bot")],
+        [InlineKeyboardButton(text="📢 𝗞𝗮𝗻𝗮𝗹𝗱𝗮𝗻 𝗯𝗼𝘁𝗴𝗮 𝗼𝗱𝗮𝗺 𝗾𝗼'𝘀𝗵𝗶𝘀𝗵", callback_data="ref_mode_channel")],
+        [InlineKeyboardButton(text="💸 𝗣𝘂𝗹𝗻𝗶 𝘆𝗲𝗰𝗵𝗶𝗯 𝗼𝗹𝗶𝘀𝗵", callback_data="ref_withdraw")]
+    ]
+    await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+@router.callback_query(F.data == "ref_mode_bot")
+async def ref_mode_bot_cb(call: CallbackQuery):
+    await call.answer()
+    uid = call.from_user.id
+    u = db.get_user(uid)
     bot_info = await bot.get_me()
     ref_link = f"https://t.me/{bot_info.username}?start=ref_{uid}"
 
@@ -1265,31 +1481,31 @@ async def referral_menu_handler(msg: Message, state: FSMContext):
     today_count = db.q("SELECT COUNT(*) c FROM referrals WHERE referrer_id=? AND status='rewarded' AND created_at LIKE ?",
                        (uid, f"{today_prefix}%"), one=True)["c"]
     total_refs = db.q("SELECT COUNT(*) c FROM referrals WHERE referrer_id=? AND status='rewarded'", (uid,), one=True)["c"]
-
     ref_bal = u["referral_balance"] if u else 0
+
     text = (
-        f"👥 <b>DO'STLARNI TAKLIF QILISH VA PUL ISHLASH TIZIMI</b>\n"
+        f"👤 <b>BOTGA DO'STLARNI TAKLIF QILISH TIZIMI</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💰 <b>Sizning referal balansingiz:</b> <b>{fmt(ref_bal)} so'm</b>\n"
         f"👥 <b>Jami taklif qilingan do'stlar:</b> <b>{total_refs} ta</b>\n"
         f"📊 <b>Bugun tasdiqlanganlar:</b> <b>{today_count}/20 ta</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📌 <b>REFERAL DASTURI SHARTLARI:</b>\n"
-        f"├ ➕ <b>Mukofot:</b> Har bir qo'shilgan do'stingiz uchun <b>+100 so'm</b>\n"
-        f"├ 📢 <b>Shart:</b> Do'stingiz botga kirib kanallarga a'zo bo'lishi shart\n"
-        f"├ ⏳ <b>Kunlik chegara:</b> Kuniga ko'pi bilan <b>20 ta</b> do'st\n"
-        f"├ ⚠️ <b>Jarima:</b> Do'stingiz kanaldan chiqib ketsa: <b>-200 so'm</b>\n"
+        f"├ ➕ <b>Har bir do'st uchun:</b> <b>+100 so'm</b> (kanallarga a'zo bo'lgach)\n"
+        f"├ 🛍 <b>Savdo mukofoti:</b> Taklif qilgan do'stingiz kamida <b>20 000 so'm</b>lik savdo qilsa — hisobingizga <b>+1 000 so'm</b> qo'shiladi!\n"
+        f"├ ⚠️ <b>Jarima:</b> Do'stingiz kanallardan chiqib ketsa — hisobingizdan <b>-200 so'm</b> ayiriladi (balans manfiy bo'lishi mumkin)!\n"
         f"└ 💳 <b>Minimal yechish summasi:</b> <b>10 000 so'm</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔗 <b>SIZNING SHAXSIY TAKLIF HAVOLANGIZ:</b>\n"
+        f"🔗 <b>SIZNING SHAXSIY HAVOLANGIZ:</b>\n"
         f"👉 <code>{ref_link}</code>\n"
         f"<i>(Havola ustiga bosing — avtomatik nusxalanadi!)</i>"
     )
     kb = [
-        [InlineKeyboardButton(text="💸 𝗣𝘂𝗹𝗻𝗶 𝘆𝗲𝗰𝗵𝗶𝗯 𝗼𝗹𝗶𝘀𝗵 (𝗞𝗮𝗿𝘁𝗮𝗴𝗮)", callback_data="ref_withdraw")],
-        [InlineKeyboardButton(text="📊 𝗠𝗲𝗻𝗶𝗻𝗴 𝗿𝗲𝗳𝗲𝗿𝗮𝗹𝗹𝗮𝗿𝗶𝗺 𝗿𝗼'𝘆𝘅𝗮𝘁𝗶", callback_data="ref_stats")]
+        [InlineKeyboardButton(text="📊 𝗠𝗲𝗻𝗶𝗻𝗴 𝗿𝗲𝗳𝗲𝗿𝗮𝗹𝗹𝗮𝗿𝗶𝗺 𝗿𝗼'𝘆𝘅𝗮𝘁𝗶", callback_data="ref_stats")],
+        [InlineKeyboardButton(text="💸 𝗣𝘂𝗹𝗻𝗶 𝘆𝗲𝗰𝗵𝗶𝗯 𝗼𝗹𝗶𝘀𝗵", callback_data="ref_withdraw")],
+        [InlineKeyboardButton(text="🔙 𝗢𝗿𝗾𝗮𝗴𝗮", callback_data="ref_back_main")]
     ]
-    await msg.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
 @router.callback_query(F.data == "ref_stats")
 async def ref_stats_callback(call: CallbackQuery):
@@ -1306,6 +1522,178 @@ async def ref_stats_callback(call: CallbackQuery):
         text += f"👤 ID: <code>{r['referred_id']}</code> | {st} ({date_s})\n"
     await call.message.answer(text)
 
+@router.callback_query(F.data == "ref_mode_channel")
+async def ref_mode_channel_cb(call: CallbackQuery):
+    await call.answer()
+    uid = call.from_user.id
+    u = db.get_user(uid)
+    ref_bal = u["referral_balance"] if u else 0
+    channels = db.get_user_channels(uid)
+    interval_h = db.get_setting("channel_post_interval_hours", "1")
+
+    text = (
+        f"📢 <b>KANALDAN BOTGA ODAM QO'SHISH VA PUL ISHLASH</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Siz bu bo'lim orqali o'z kanalingizga botni admin qilib qo'shasiz va kanalingiz havolasini yuborasiz.\n\n"
+        f"Biz botimiz orqali <b>har {interval_h} soatda</b> sizning kanalingizga referal havolangiz bilan chiroyli reklama posti yuborib turamiz!\n\n"
+        f"💰 <b>DAROMAD VA SHARTLAR:</b>\n"
+        f"├ ➕ <b>Har bir a'zo uchun:</b> <b>+100 so'm</b> (majburiy kanallarga a'zo bo'lgach qo'shiladi)\n"
+        f"├ 🛍 <b>Savdo qilganda:</b> Kirgan odam kamida <b>20 000 so'm</b>lik savdo qilsa va botga pul tushsa — sizga <b>+1 000 so'm</b> beriladi (20 000 dan kam savdoga berilmaydi)!\n"
+        f"└ ⚠️ <b>Jarima:</b> Agar kirgan a'zo majburiy kanallardan chiqib ketsa — hisobingizdan <b>-200 so'm</b> ayiriladi (balans 0 bo'lsa, -200 bo'lib qoladi)!\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📌 <i>Hozirda ulangan kanallaringiz: <b>{len(channels)} ta</b></i>\n"
+        f"💰 <i>Balansingiz: <b>{fmt(ref_bal)} so'm</b></i>\n\n"
+        f"👇 <i>Davom etish uchun quyidagi tugmalardan birini tanlang:</i>"
+    )
+    kb = [
+        [InlineKeyboardButton(text="➕ 𝗬𝗮𝗻𝗴𝗶 𝗸𝗮𝗻𝗮𝗹 𝘂𝗹𝗮𝘀𝗵", callback_data="ref_add_channel")],
+        [InlineKeyboardButton(text="📊 𝗨𝗹𝗮𝗴𝗮𝗻 𝗸𝗮𝗻𝗮𝗹𝗹𝗮𝗿𝗶𝗺 (𝗦𝘁𝗮𝘁𝗶𝘀𝘁𝗶𝗸𝗮)", callback_data="ref_my_channels")],
+        [InlineKeyboardButton(text="💸 𝗣𝘂𝗹𝗻𝗶 𝘆𝗲𝗰𝗵𝗶𝗯 𝗼𝗹𝗶𝘀𝗵", callback_data="ref_withdraw")],
+        [InlineKeyboardButton(text="🔙 𝗢𝗿𝗾𝗮𝗴𝗮", callback_data="ref_back_main")]
+    ]
+    await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+@router.callback_query(F.data == "ref_add_channel")
+async def ref_add_channel_start(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    await state.set_state(ConnectChannelFSM.channel_link)
+    bot_info = await bot.get_me()
+    bot_un = f"@{bot_info.username}" if bot_info and bot_info.username else "@KafilBot"
+    await call.message.answer(
+        f"📢 <b>KANALNI BOTGA ADMIN QILIB ULASH:</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"1. O'z kanalingiz sozlamalariga kiring va <b>{bot_un}</b> botini kanalga <b>ADMINISTRATOR</b> qilib qo'shing hamda <b>barcha huquqlarni (xabar yozish huquqini)</b> yoqing!\n\n"
+        f"2. So'ngra kanalingizning havolasini bu yerga yuboring.\n"
+        f"<i>(Havola kanalning o'zidan olingan havola ham bo'laveradi, masalan: <code>https://t.me/kanalingiz</code> yoki <code>kanalingiz</code> — @ bilan yozilishi shart emas).</i>",
+        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ 𝗕𝗲𝗸𝗼𝗿 𝗾𝗶𝗹𝗶𝘀𝗵")]], resize_keyboard=True)
+    )
+
+@router.message(ConnectChannelFSM.channel_link)
+async def proc_connect_channel(msg: Message, state: FSMContext):
+    if any(w in msg.text.lower() for w in ["bekor", "cancel"]) or msg.text.startswith("❌"):
+        await state.clear()
+        await msg.answer("Bekor qilindi.", reply_markup=main_menu_keyboard(msg.from_user.id))
+        return
+
+    raw = msg.text.strip()
+    clean_un = re.sub(r"^(https?:\/\/)?(www\.)?t\.me\/", "", raw).split('/')[0].split('?')[0].lstrip('@').strip()
+
+    if raw.startswith("-100") or (raw.startswith("-") and raw[1:].isdigit()):
+        target = int(raw)
+    elif raw.isdigit():
+        target = int(f"-100{raw}")
+    else:
+        target = f"@{clean_un}"
+
+    try:
+        chat = await bot.get_chat(target)
+        bot_member = await bot.get_chat_member(chat.id, bot.id)
+        if bot_member.status not in ("administrator", "creator"):
+            await msg.answer(
+                "❌ <b>Bot ushbu kanalda administrator emas!</b>\n\n"
+                "Iltimos, avval botni kanalga admin qilib qo'shing va xabar yozish huquqini bering, so'ngra qaytadan havolani yuboring."
+            )
+            return
+
+        ch_id = str(chat.id)
+        ch_title = chat.title or "Mening kanalim"
+        ch_un = chat.username or ""
+        ch_link = f"https://t.me/{ch_un}" if ch_un else (chat.invite_link or f"https://t.me/{clean_un}")
+
+        db.add_user_channel(msg.from_user.id, ch_id, ch_title, ch_un, ch_link)
+
+        # Kanallarga yuboriladigan bir xil shaxsiy referal havolasi:
+        bot_info = await bot.get_me()
+        bot_un = bot_info.username or "KafilBot"
+        ref_link = f"https://t.me/{bot_un}?start=ref_{msg.from_user.id}"
+
+        post_text = (
+            f"🛡 <b>XAVFSIZ VA ISHONCHLI SAVDO (GARANT) BOTI!</b>\n\n"
+            f"Ushbu bot orqali begona odamlar bilan har qanday savdolarni (akkaunt, kanal, xizmatlar) "
+            f"100% ishonchli va xavfsiz amalga oshirishingiz mumkin!\n\n"
+            f"💰 Shuningdek, botga do'stlaringizni taklif qilib, har bir a'zo uchun pul ishlashingiz mumkin.\n\n"
+            f"👇 <b>Botni ishga tushirish uchun bosing:</b>\n"
+            f"{ref_link}"
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🚀 Botga kirish va pul ishlash", url=ref_link)]
+        ])
+        ad_photo = db.get_setting("channel_ad_photo", "")
+        try:
+            if ad_photo:
+                await bot.send_photo(chat.id, photo=ad_photo, caption=post_text, reply_markup=kb)
+            else:
+                await bot.send_message(chat.id, text=post_text, reply_markup=kb)
+            db.update_channel_last_post(ch_id)
+        except Exception as exc:
+            logger.warning(f"Dastlabki post yuborishda xato: {exc}")
+
+        await state.clear()
+        await msg.answer(
+            f"🎉 <b>KANALINGIZ MUVAFFAQIYATLI ULANDI!</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📢 <b>Kanal:</b> {esc_html(ch_title)}\n"
+            f"🔗 <b>Havola:</b> {ch_link}\n"
+            f"🆔 <b>Kanal ID:</b> <code>{ch_id}</code>\n\n"
+            f"✅ Kanalingizga birinchi reklama posti muvaffaqiyatli yuborildi!\n"
+            f"⏰ Bot har 1 soatda avtomatik ravishda kanalingizga sizning referal havolangiz bilan post joylab boradi.\n\n"
+            f"💰 Kanalingizdan kirgan har bir a'zo uchun +100 so'm, savdo qilganlar uchun esa +1 000 so'mdan hisobingizga qo'shiladi!",
+            reply_markup=main_menu_keyboard(msg.from_user.id)
+        )
+    except Exception as e:
+        logger.warning(f"Kanalni ulashda xato: {e}")
+        await msg.answer(
+            f"❌ <b>Kanal topilmadi yoki xatolik yuz berdi:</b>\n<i>{esc_html(str(e))}</i>\n\n"
+            f"Iltimos, bot kanalga admin qilib qo'shilganini va havola to'g'riligini tekshirib qaytadan yuboring."
+        )
+
+@router.callback_query(F.data == "ref_my_channels")
+async def ref_my_channels_cb(call: CallbackQuery):
+    await call.answer()
+    uid = call.from_user.id
+    u = db.get_user(uid)
+    ref_bal = u["referral_balance"] if u else 0
+    channels = db.get_user_channels(uid)
+    bot_info = await bot.get_me()
+    ref_link = f"https://t.me/{bot_info.username}?start=ref_{uid}"
+
+    today_s = datetime.now(TZ).strftime("%Y-%m-%d")
+    total_joined = db.q("SELECT COUNT(*) c FROM referrals WHERE referrer_id=?", (uid,), one=True)["c"]
+    total_deals = db.q("SELECT COUNT(*) c FROM referrals WHERE referrer_id=? AND deal_reward_given=1", (uid,), one=True)["c"]
+    total_left = db.q("SELECT COUNT(*) c FROM referrals WHERE referrer_id=? AND status='penalized'", (uid,), one=True)["c"]
+    today_in = db.q("SELECT COUNT(*) c FROM referrals WHERE referrer_id=? AND created_at LIKE ?", (uid, f"{today_s}%"), one=True)["c"]
+    today_out = db.q("SELECT COUNT(*) c FROM referrals WHERE referrer_id=? AND status='penalized' AND updated_at LIKE ?", (uid, f"{today_s}%"), one=True)["c"]
+    interval_h = db.get_setting("channel_post_interval_hours", "1")
+
+    text = (
+        f"📊 <b>SIZNING ULANGAN KANALLARINGIZ VA STATISTIKA:</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 <b>Hisobingizdagi balans:</b> <b>{fmt(ref_bal)} so'm</b>\n"
+        f"🔗 <b>Umumiy referal havolangiz:</b>\n<code>{ref_link}</code>\n"
+        f"⏰ <b>Bot post yuborish oralig'i:</b> Har <b>{interval_h} soatda</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👥 <b>Havola orqali kirganlar (jami):</b> <b>{total_joined} ta</b>\n"
+        f"🛍 <b>Savdo qilganlar (20k+):</b> <b>{total_deals} ta</b> (+{fmt(total_deals * 1000)} so'm)\n"
+        f"🚫 <b>Chiqib ketganlar (jarima):</b> <b>{total_left} ta</b> (-{fmt(total_left * 200)} so'm)\n"
+        f"📥 <b>Bugun kirganlar:</b> <b>{today_in} ta</b>\n"
+        f"📤 <b>Bugun chiqib ketganlar:</b> <b>{today_out} ta</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📢 <b>Ulagan kanallaringiz ro'yxati ({len(channels)} ta):</b>\n"
+    )
+    if not channels:
+        text += "<i>Hozircha hech qanday kanal ulamagansiz.</i>\n"
+    else:
+        for idx, ch in enumerate(channels, 1):
+            ch_url = ch["channel_link"] or (f"@{ch['channel_username']}" if ch["channel_username"] else ch["channel_id"])
+            text += f"{idx}. <b>{esc_html(ch['channel_title'])}</b> ({ch_url})\n   └ Yuborilgan postlar: <b>{ch['total_posts']} ta</b>\n"
+
+    kb = [
+        [InlineKeyboardButton(text="➕ 𝗬𝗮𝗻𝗴𝗶 𝗸𝗮𝗻𝗮𝗹 𝘂𝗹𝗮𝘀𝗵", callback_data="ref_add_channel")],
+        [InlineKeyboardButton(text="💸 𝗣𝘂𝗹𝗻𝗶 𝘆𝗲𝗰𝗵𝗶𝗯 𝗼𝗹𝗶𝘀𝗵", callback_data="ref_withdraw")],
+        [InlineKeyboardButton(text="🔙 𝗢𝗿𝗾𝗮𝗴𝗮", callback_data="ref_mode_channel")]
+    ]
+    await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
 @router.callback_query(F.data == "ref_withdraw")
 async def ref_withdraw_start(call: CallbackQuery, state: FSMContext):
     await call.answer()
@@ -1318,92 +1706,116 @@ async def ref_withdraw_start(call: CallbackQuery, state: FSMContext):
             f"⚠️ <b>MABLAG' YETARLI EMAS!</b>\n\n"
             f"Minimal yechish summasi: <b>10 000 so'm</b>.\n"
             f"Sizning balansingiz: <b>{fmt(bal)} so'm</b>.\n\n"
-            f"Mablag'ni yechish uchun do'stlaringizni taklif qilib balansingizni 10 000 so'mga yetkazing."
+            f"Mablag'ni yechish uchun do'stlaringizni taklif qilib yoki kanalingizni ulab balansingizni 10 000 so'mga yetkazing."
         )
         return
 
-    await state.set_state(WithdrawFSM.card_number)
-    await state.update_data(withdraw_amount=bal)
+    await state.set_state(WithdrawFSM.amount)
     await call.message.answer(
-        f"💸 <b>PULNI YECHIB OLISH: {fmt(bal)} so'm</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"To'lovni qabul qiluvchi <b>16 xonali plastik karta raqamini</b> kiriting:\n"
-        f"<i>(Masalan: 8600 0000 0000 0000 yoki 9860 ...)</i>",
+        f"💸 <b>PUL YECHIB OLISH:</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Sizning balansingiz: <b>{fmt(bal)} so'm</b>\n\n"
+        f"Yechib olmoqchi bo'lgan summani so'mda yozing (Minimal: 10 000 so'm, Ko'pi bilan: {fmt(bal)} so'm):\n"
+        f"<i>(Masalan: <code>15000</code>)</i>",
         reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ 𝗕𝗲𝗸𝗼𝗿 𝗾𝗶𝗹𝗶𝘀𝗵")]], resize_keyboard=True)
     )
 
-@router.message(WithdrawFSM.card_number)
-async def withdraw_proc_card(msg: Message, state: FSMContext):
+@router.message(WithdrawFSM.amount)
+async def withdraw_proc_amount(msg: Message, state: FSMContext):
     if any(w in msg.text.lower() for w in ["bekor", "cancel"]) or msg.text.startswith("❌"):
         await state.clear()
         await msg.answer("Bekor qilindi.", reply_markup=main_menu_keyboard(msg.from_user.id))
         return
 
-    is_valid, err_msg, clean_card = validate_user_input("card_number", msg.text)
-    if not is_valid:
-        await msg.answer(err_msg)
+    digits = re.sub(r"\D", "", msg.text)
+    if not digits:
+        await msg.answer("Iltimos, summani faqat raqamlarda kiriting (masalan: 15000):")
         return
 
-    await state.update_data(card_number=clean_card)
-    await state.set_state(WithdrawFSM.card_owner)
+    amt = int(digits)
+    uid = msg.from_user.id
+    u = db.get_user(uid)
+    bal = u["referral_balance"] if u else 0
+
+    if amt < 10000:
+        await msg.answer(f"Minimal yechish summasi <b>10 000 so'm</b>! Iltimos, 10 000 yoki undan katta summa kiriting:")
+        return
+
+    if amt > bal:
+        await msg.answer(f"Balansingizda mablag' yetarli emas! Sizning balansingiz: <b>{fmt(bal)} so'm</b>. Qaytadan kiriting:")
+        return
+
+    await state.update_data(withdraw_amount=amt)
+    await state.set_state(WithdrawFSM.anketa)
+
     await msg.answer(
-        f"Karta: <code>{format_card(clean_card)}</code>\n\n"
-        f"👤 <b>Karta egasining Ism-Familiyasini kiriting:</b>\n"
-        f"<i>(Masalan: ALIYEV VALI)</i>"
+        f"📋 <b>PUL YECHIB OLISH ANKETASI:</b>\n"
+        f"Yechilayotgan summa: <b>{fmt(amt)} so'm</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Quyidagi shablon ustiga bosib nusxalang, karta raqamingiz va ism-familiyangizni to'ldirib yuboring:\n\n"
+        f"<code>1. Karta raqam: \n2. Karta egasi: </code>\n\n"
+        f"<i>(Namuna: <code>1. Karta raqam: 8600 0000 0000 0000\n2. Karta egasi: ALIYEV VALI</code>)</i>\n\n"
+        f"<i>AI ma'lumotlaringizni to'liq tekshirib, so'rovingizni adminga taqdim etadi.</i>",
+        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ 𝗕𝗲𝗸𝗼𝗿 𝗾𝗶𝗹𝗶𝘀𝗵")]], resize_keyboard=True)
     )
 
-@router.message(WithdrawFSM.card_owner)
-async def withdraw_proc_owner(msg: Message, state: FSMContext):
+@router.message(WithdrawFSM.anketa)
+async def withdraw_proc_anketa(msg: Message, state: FSMContext):
     if any(w in msg.text.lower() for w in ["bekor", "cancel"]) or msg.text.startswith("❌"):
         await state.clear()
         await msg.answer("Bekor qilindi.", reply_markup=main_menu_keyboard(msg.from_user.id))
         return
 
-    is_valid, err_msg, clean_owner = validate_user_input("card_owner", msg.text)
+    is_valid, err_msg, clean_card, clean_owner = parse_withdrawal_anketa(msg.text)
     if not is_valid:
-        await msg.answer(err_msg)
+        await msg.answer(
+            f"{err_msg}\n\n"
+            f"Iltimos, ma'lumotlarni to'g'ri to'ldirib qayta yuboring:\n"
+            f"<code>1. Karta raqam: 8600 0000 0000 0000\n2. Karta egasi: ISMI FAMILIYASI</code>"
+        )
         return
 
-    owner = clean_owner
     data = await state.get_data()
-    amount = data["withdraw_amount"]
-    card = data["card_number"]
+    amount = data.get("withdraw_amount", 10000)
     uid = msg.from_user.id
-    await state.clear()
-
     u = db.get_user(uid)
     if not u or u["referral_balance"] < amount:
+        await state.clear()
         await msg.answer("Xatolik: Balans yetarli emas.", reply_markup=main_menu_keyboard(uid))
         return
 
     db.q("UPDATE users SET referral_balance=referral_balance-? WHERE user_id=?", (amount, uid), commit=True)
-    w_id = db.create_withdrawal(uid, amount, card, owner)
+    w_id = db.create_withdrawal(uid, amount, clean_card, clean_owner)
+    await state.clear()
 
     await msg.answer(
-        f"✅ <b>SO'ROV ADMINGA YUBORILDI!</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"So'rov raqami: <b>#{w_id}</b>\n"
-        f"Yechilayotgan summa: <b>{fmt(amount)} so'm</b>\n"
-        f"Karta: <code>{format_card(card)}</code> ({owner})\n\n"
-        f"Admin tez orada pulingizni tashlab beradi. Rahmat!",
+        f"✅ <b>PUL YECHISH SO'ROVINGIZ ADMINGA YUBORILDI!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🆔 So'rov raqami: <b>#{w_id}</b>\n"
+        f"💵 Yechilayotgan summa: <b>{fmt(amount)} so'm</b>\n"
+        f"💳 Karta: <code>{format_card(clean_card)}</code>\n"
+        f"👤 Egasi: <b>{clean_owner}</b>\n\n"
+        f"🛡 Admin tez orada mablag'ni kartangizga o'tkazib beradi va bot sizga xabar yuboradi!",
         reply_markup=main_menu_keyboard(uid)
     )
 
-    for a_id in ADMIN_IDS:
-        try:
-            adm_kb = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="✅ To'landi deb belgilash", callback_data=f"adm_pay_w:{w_id}")]
-            ])
-            await bot.send_message(
-                a_id,
-                f"💸 <b>YANGI PUL YECHISH SO'ROVI: #{w_id}</b>\n"
-                f"Foydalanuvchi: ID <code>{uid}</code> (@{esc_html(msg.from_user.username or '')})\n"
-                f"Summa: <b>{fmt(amount)} so'm</b>\n"
-                f"Karta: <code>{format_card(card)}</code> ({owner})",
-                reply_markup=adm_kb
-            )
-        except Exception:
-            pass
+    admin_id = int(db.get_setting("admin_id", ADMIN_IDS[0]))
+    try:
+        adm_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ To'landi deb belgilash", callback_data=f"adm_pay_w:{w_id}")]
+        ])
+        await bot.send_message(
+            admin_id,
+            f"💸 <b>YANGI PUL YECHISH SO'ROVI: #{w_id}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 Foydalanuvchi: @{esc_html(msg.from_user.username or 'yoq')} (ID: <code>{uid}</code>)\n"
+            f"💰 Summa: <b>{fmt(amount)} so'm</b>\n"
+            f"💳 Karta: <code>{format_card(clean_card)}</code>\n"
+            f"👤 Karta egasi: <b>{clean_owner}</b>",
+            reply_markup=adm_kb
+        )
+    except Exception as exc:
+        logger.warning(f"Adminga so'rov yuborishda xato: {exc}")
 
 # ============================ 11. 4-TUGMA: 🤝 YANGI SAVDO OCHISH ============================
 @router.message(StateFilter("*"), F.text.contains("Yangi Savdo") | F.text.contains("𝗬𝗮𝗻𝗴𝗶 𝗦𝗮𝘃𝗱𝗼") | F.text.contains("Savdo") | F.text.contains("𝗦𝗮𝘃𝗱𝗼"))
@@ -2364,6 +2776,9 @@ async def admin_panel_handler(msg: Message, state: FSMContext):
 
     admin_anim_emoji = '<tg-emoji emoji-id="6046154264353442824">🌟</tg-emoji>'
 
+    total_uc = db.q("SELECT COUNT(*) c FROM user_channels WHERE is_active=1", one=True)["c"]
+    total_uc_users = db.q("SELECT COUNT(*) c FROM referrals WHERE source_channel_id IS NOT NULL", one=True)["c"]
+
     text = (
         f"{admin_anim_emoji} <b>BOSH ADMIN BOSHQARUV MARKAZI</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -2371,6 +2786,8 @@ async def admin_panel_handler(msg: Message, state: FSMContext):
         f"📢 <b>Isbotlar kanali:</b> <b>{proofs_display}</b>\n\n"
         f"📊 <b>TIZIMNING UMUMIY STATISTIKASI:</b>\n"
         f"├ 👥 <b>Foydalanuvchilar:</b> <b>{total_u} ta</b>\n"
+        f"├ 📢 <b>Ulangan kanallar:</b> <b>{total_uc} ta</b>\n"
+        f"├ 👥 <b>Kanallardan kirganlar:</b> <b>{total_uc_users} ta</b>\n"
         f"├ 📦 <b>Jami amalga oshgan bitimlar:</b> <b>{total_d} ta</b>\n"
         f"├ 🚫 <b>Bloklangan firibgarlar:</b> <b>{black_c} ta</b>\n"
         f"└ 💸 <b>Kutilayotgan pul yechishlar:</b> <b>{pend_w} ta</b>\n\n"
@@ -2386,6 +2803,8 @@ async def admin_panel_handler(msg: Message, state: FSMContext):
          InlineKeyboardButton(text="🚫 𝗙𝗶𝗿𝗶𝗯𝗴𝗮𝗿𝗹𝗮𝗿 𝗯𝗼𝘀𝗵𝗾𝗮𝗿𝘂𝘃𝗶", callback_data="adm_view_scammers")],
         [InlineKeyboardButton(text="📢 𝗫𝗮𝗯𝗮𝗿 𝘁𝗮𝗿𝗾𝗮𝘁𝗶𝘀𝗵", callback_data="adm_broadcast"),
          InlineKeyboardButton(text="📢 𝗠𝗮𝗷𝗯𝘂𝗿𝗶𝘆 𝗸𝗮𝗻𝗮𝗹𝗹𝗮𝗿", callback_data="adm_channels")],
+        [InlineKeyboardButton(text="🖼 𝗥𝗲𝗸𝗹𝗮𝗺𝗮 𝗿𝗮𝘀𝗺𝗶", callback_data="adm_edit_ad_photo"),
+         InlineKeyboardButton(text="📢 𝗨𝗹𝗮𝗻𝗴𝗮𝗻 𝗸𝗮𝗻𝗮𝗹𝗹𝗮𝗿", callback_data="adm_view_user_channels")],
         [InlineKeyboardButton(text="📊 𝗔𝗜 𝗧𝗮𝗵𝗹𝗶𝗹𝗶𝘆 𝗵𝗶𝘀𝗼𝗯𝗼𝘁", callback_data="adm_ai_chat"),
          InlineKeyboardButton(text="💸 𝗥𝗲𝗳𝗲𝗿𝗮𝗹 𝘀𝗼'𝗿𝗼𝘃𝗹𝗮𝗿𝗶", callback_data="adm_withdrawals")],
         [InlineKeyboardButton(text="💳 𝗞𝗮𝗿𝘁𝗮 𝘀𝗼𝘇𝗹𝗮𝘀𝗵", callback_data="adm_edit_card"),
@@ -2467,11 +2886,37 @@ async def adm_list_scammers_cb(call: CallbackQuery):
     await call.message.answer(text)
 
 @router.callback_query(F.data == "adm_broadcast")
-async def adm_broadcast_start(call: CallbackQuery, state: FSMContext):
+async def adm_broadcast_start(call: CallbackQuery):
+    await call.answer()
+    kb = [
+        [InlineKeyboardButton(text="👥 Foydalanuvchilarga xabar tarqatish", callback_data="adm_bc_users")],
+        [InlineKeyboardButton(text="📢 Ulangan kanallarga xabar tarqatish", callback_data="adm_bc_channels")]
+    ]
+    await call.message.answer(
+        "📢 <b>XABAR TARQATISH YO'NALISHINI TANLANG:</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Qayerga xabar tarqatmoqchisiz?\n\n"
+        "👥 <b>Foydalanuvchilarga:</b> Botning barcha a'zolariga yuborish.\n"
+        "📢 <b>Ulangan kanallarga:</b> Foydalanuvchilar botga ulagan barcha kanallarga yuborish.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
+    )
+
+@router.callback_query(F.data == "adm_bc_users")
+async def adm_bc_users_cb(call: CallbackQuery, state: FSMContext):
     await call.answer()
     await state.set_state(AdminFSM.broadcast)
     await call.message.answer(
-        "📢 Barcha bot foydalanuvchilariga yuboriladigan xabarni (matn, rasm yoki post) yuboring:",
+        "👥 <b>Barcha bot foydalanuvchilariga</b> yuboriladigan xabarni (matn, rasm yoki post) yuboring:",
+        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ 𝗕𝗲𝗸𝗼𝗿 𝗾𝗶𝗹𝗶𝘀𝗵")]], resize_keyboard=True)
+    )
+
+@router.callback_query(F.data == "adm_bc_channels")
+async def adm_bc_channels_cb(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    await state.set_state(AdminFSM.broadcast_channels)
+    active_ch = db.get_active_user_channels()
+    await call.message.answer(
+        f"📢 <b>Barcha ulangan kanallarga ({len(active_ch)} ta)</b> yuboriladigan xabarni (matn, rasm yoki post) yuboring:",
         reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ 𝗕𝗲𝗸𝗼𝗿 𝗾𝗶𝗹𝗶𝘀𝗵")]], resize_keyboard=True)
     )
 
@@ -2485,7 +2930,7 @@ async def adm_proc_broadcast(msg: Message, state: FSMContext):
     users = db.q("SELECT user_id FROM users")
     await state.clear()
     sent, failed = 0, 0
-    prog = await msg.answer(f"Xabar yuborilmoqda... 0/{len(users)}")
+    prog = await msg.answer(f"Foydalanuvchilarga yuborilmoqda... 0/{len(users)}")
     for u in users:
         try:
             await msg.copy_to(chat_id=u["user_id"])
@@ -2493,7 +2938,98 @@ async def adm_proc_broadcast(msg: Message, state: FSMContext):
             await asyncio.sleep(0.05)
         except Exception:
             failed += 1
-    await prog.edit_text(f"✅ Xabar tarqatish yakunlandi!\nYetkazildi: {sent} ta\nYetib bormadi: {failed} ta")
+    await prog.edit_text(f"✅ Foydalanuvchilarga tarqatish yakunlandi!\nYetkazildi: {sent} ta\nYetib bormadi: {failed} ta")
+
+@router.message(AdminFSM.broadcast_channels)
+async def adm_proc_broadcast_channels(msg: Message, state: FSMContext):
+    if any(w in msg.text.lower() for w in ["bekor", "cancel"]) or msg.text.startswith("❌"):
+        await state.clear()
+        await msg.answer("Bekor qilindi.", reply_markup=main_menu_keyboard(msg.from_user.id))
+        return
+
+    channels = db.get_active_user_channels()
+    await state.clear()
+    sent, failed = 0, 0
+    prog = await msg.answer(f"Kanallarga yuborilmoqda... 0/{len(channels)}")
+    for ch in channels:
+        try:
+            cid = int(ch["channel_id"]) if str(ch["channel_id"]).lstrip("-").isdigit() else ch["channel_id"]
+            await msg.copy_to(chat_id=cid)
+            sent += 1
+            await asyncio.sleep(0.1)
+        except Exception as e:
+            failed += 1
+            logger.warning(f"Kanalga broadcast xatosi ({ch['channel_id']}): {e}")
+    await prog.edit_text(f"✅ Kanallarga tarqatish yakunlandi!\nYetkazildi: {sent} ta\nYetib bormadi: {failed} ta")
+
+@router.callback_query(F.data == "adm_edit_ad_photo")
+async def adm_edit_ad_photo_cb(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        await call.answer("Ruxsat berilmagan!", show_alert=True)
+        return
+    await call.answer()
+    await state.set_state(AdminFSM.change_ad_photo)
+    curr_ph = db.get_setting("channel_ad_photo", "")
+    st_text = "O'rnatilgan" if curr_ph else "O'rnatilmagan"
+    await call.message.answer(
+        f"🖼 <b>KANALLAR UCHUN REKLAMA RASMINI SOZLASH:</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Hozirgi holat: <b>{st_text}</b>\n\n"
+        f"Bot ulangan kanallarga har 1 soatda yuboradigan reklama rasmini yuboring (rasm formatida):\n\n"
+        f"<i>(Agar rasmni o'chirmoqchi bo'lsangiz, 'ochirish' deb yozing)</i>",
+        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ 𝗕𝗲𝗸𝗼𝗿 𝗾𝗶𝗹𝗶𝘀𝗵")]], resize_keyboard=True)
+    )
+
+@router.message(AdminFSM.change_ad_photo)
+async def adm_proc_change_ad_photo(msg: Message, state: FSMContext):
+    if any(w in (msg.text or "").lower() for w in ["bekor", "cancel"]) or (msg.text and msg.text.startswith("❌")):
+        await state.clear()
+        await msg.answer("Bekor qilindi.", reply_markup=main_menu_keyboard(msg.from_user.id))
+        return
+
+    if msg.text and "ochirish" in msg.text.lower():
+        db.set_setting("channel_ad_photo", "")
+        await state.clear()
+        await msg.answer("✅ Reklama rasmi o'chirildi (postlar faqat matn bilan chiqadi).", reply_markup=main_menu_keyboard(msg.from_user.id))
+        return
+
+    if not msg.photo:
+        await msg.answer("Iltimos, rasm formatida yuboring yoki '❌ Bekor qilish'ni bosing:")
+        return
+
+    photo_id = msg.photo[-1].file_id
+    db.set_setting("channel_ad_photo", photo_id)
+    await state.clear()
+    await msg.answer("✅ Reklama rasmi muvaffaqiyatli saqlandi! Endi barcha kanallarga ushbu rasm bilan xabar yuboriladi.", reply_markup=main_menu_keyboard(msg.from_user.id))
+
+@router.callback_query(F.data == "adm_view_user_channels")
+async def adm_view_user_channels_cb(call: CallbackQuery):
+    await call.answer()
+    channels = db.q("""
+    SELECT uc.*, u.username, u.full_name 
+    FROM user_channels uc 
+    LEFT JOIN users u ON uc.user_id = u.user_id 
+    WHERE uc.is_active = 1 
+    ORDER BY uc.id DESC LIMIT 20
+    """)
+    if not channels:
+        await call.message.answer("Hozircha foydalanuvchilar tomonidan ulangan kanallar mavjud emas.")
+        return
+
+    text = "📢 <b>FOYDALANUVCHILAR ULAGAN KANALLAR:</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    for ch in channels:
+        u_tag = f"@{ch['username']}" if ch['username'] else f"ID {ch['user_id']}"
+        joined_c = db.q("SELECT COUNT(*) c FROM referrals WHERE referrer_id=?", (ch["user_id"],), one=True)["c"]
+        deals_c = db.q("SELECT COUNT(*) c FROM referrals WHERE referrer_id=? AND deal_reward_given=1", (ch["user_id"],), one=True)["c"]
+        text += (
+            f"🔹 <b>{esc_html(ch['channel_title'])}</b>\n"
+            f"├ 👤 Egasi: {u_tag}\n"
+            f"├ 🔗 Havola: {ch['channel_link'] or ch['channel_id']}\n"
+            f"├ 👥 Kirganlar: <b>{joined_c} ta</b> | Savdo qilganlar: <b>{deals_c} ta</b>\n"
+            f"└ 📨 Yuborilgan postlar: <b>{ch['total_posts']} ta</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        )
+    await call.message.answer(text)
 
 @router.callback_query(F.data == "adm_channels")
 async def adm_channels_menu(call: CallbackQuery):
@@ -3227,6 +3763,7 @@ async def main():
     asyncio.create_task(global_payment_watcher_loop())
     asyncio.create_task(complaints_auto_expire_loop())
     asyncio.create_task(referral_leave_checker_loop())
+    asyncio.create_task(channel_autopost_loop())
     logger.info(f"Kafil / Garant Boti to'liq ishga tushdi! Adminlar: {ADMIN_IDS}")
     while True:
         try:
