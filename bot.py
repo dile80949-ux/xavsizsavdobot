@@ -296,52 +296,60 @@ async def check_user_subscribed(user_id: int) -> Tuple[bool, List[dict]]:
     return (len(unsubscribed) == 0), unsubscribed
 
 async def reward_referral_if_eligible(referred_id: int):
-    # 1. Foydalanuvchi majburiy kanallarga a'zo bo'lganini qat'iy tekshirish
-    is_sub, _ = await check_user_subscribed(referred_id)
-    if not is_sub:
-        return
-
-    # 2. Telefon raqami tasdiqlangan bo'lishi shart
-    u = db.get_user(referred_id)
-    if not u or not u.get("phone_number") or not u.get("referred_by"):
-        return
-    ref_row = db.q("SELECT * FROM referrals WHERE referred_id=? AND status='pending'", (referred_id,), one=True)
-    if not ref_row:
-        return
-
-    referrer_id = u["referred_by"]
-    source_ch = ref_row.get("source_channel_id")
-
-    # Agar kanaldan bo'lmasa, kunlik 20 ta limitni tekshirish
-    if not source_ch:
-        today_prefix = datetime.now(TZ).strftime("%Y-%m-%d")
-        today_count = db.q("SELECT COUNT(*) c FROM referrals WHERE referrer_id=? AND status='rewarded' AND created_at LIKE ?",
-                           (referrer_id, f"{today_prefix}%"), one=True)["c"]
-        if today_count >= 20:
-            logger.info(f"Referrer {referrer_id} kunlik 20 ta limitga yetgan.")
-            return
-        extra_info = f"Bugun qo'shgan do'stlaringiz: <b>{today_count + 1}/20 ta</b>"
-    else:
-        extra_info = "Kanalingiz orqali yangi a'zo qo'shildi!"
-
-    # Admin belgilagan dinamik referal mukofoti:
-    ref_reward = int(db.get_setting("referral_reward_amount", "100"))
-
-    now_s = datetime.now(TZ).isoformat()
-    db.q("UPDATE users SET referral_balance=referral_balance+? WHERE user_id=?", (ref_reward, referrer_id), commit=True)
-    db.q("UPDATE referrals SET status='rewarded', updated_at=? WHERE id=?", (now_s, ref_row["id"]), commit=True)
-
     try:
-        await bot.send_message(
-            referrer_id,
-            f"🎉 <b>YANGI REFERAL MUKOFOTI!</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Siz taklif qilgan foydalanuvchi (@{esc_html(u['username'] or str(referred_id))}) majburiy kanallarga a'zo bo'ldi va telefonini tasdiqladi.\n"
-            f"💰 Hisobingizga <b>+{fmt(ref_reward)} so'm</b> qo'shildi!\n"
-            f"{extra_info}"
-        )
-    except Exception:
-        pass
+        # 1. Foydalanuvchi majburiy kanallarga a'zo bo'lganini qat'iy tekshirish
+        is_sub, _ = await check_user_subscribed(referred_id)
+        if not is_sub:
+            return
+
+        # 2. Telefon raqami tasdiqlangan bo'lishi shart
+        raw_u = db.get_user(referred_id)
+        if not raw_u:
+            return
+        u = dict(raw_u)
+        if not u.get("phone_number") or not u.get("referred_by"):
+            return
+
+        raw_ref = db.q("SELECT * FROM referrals WHERE referred_id=? AND status='pending'", (referred_id,), one=True)
+        if not raw_ref:
+            return
+        ref_row = dict(raw_ref)
+
+        referrer_id = u["referred_by"]
+        source_ch = ref_row.get("source_channel_id")
+
+        # Agar kanaldan bo'lmasa, kunlik 20 ta limitni tekshirish
+        if not source_ch:
+            today_prefix = datetime.now(TZ).strftime("%Y-%m-%d")
+            today_count = db.q("SELECT COUNT(*) c FROM referrals WHERE referrer_id=? AND status='rewarded' AND created_at LIKE ?",
+                               (referrer_id, f"{today_prefix}%"), one=True)["c"]
+            if today_count >= 20:
+                logger.info(f"Referrer {referrer_id} kunlik 20 ta limitga yetgan.")
+                return
+            extra_info = f"Bugun qo'shgan do'stlaringiz: <b>{today_count + 1}/20 ta</b>"
+        else:
+            extra_info = "Kanalingiz orqali yangi a'zo qo'shildi!"
+
+        # Admin belgilagan dinamik referal mukofoti:
+        ref_reward = int(db.get_setting("referral_reward_amount", "100"))
+
+        now_s = datetime.now(TZ).isoformat()
+        db.q("UPDATE users SET referral_balance=referral_balance+? WHERE user_id=?", (ref_reward, referrer_id), commit=True)
+        db.q("UPDATE referrals SET status='rewarded', updated_at=? WHERE id=?", (now_s, ref_row["id"]), commit=True)
+
+        try:
+            await bot.send_message(
+                referrer_id,
+                f"🎉 <b>YANGI REFERAL MUKOFOTI!</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"Siz taklif qilgan foydalanuvchi (@{esc_html(u.get('username') or str(referred_id))}) majburiy kanallarga a'zo bo'ldi va telefonini tasdiqladi.\n"
+                f"💰 Hisobingizga <b>+{fmt(ref_reward)} so'm</b> qo'shildi!\n"
+                f"{extra_info}"
+            )
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"reward_referral_if_eligible xatosi: {e}")
 
 async def penalize_referral_if_left(user_id: int):
     ref = db.q("SELECT * FROM referrals WHERE referred_id=? AND status='rewarded'", (user_id,), one=True)
@@ -1043,18 +1051,25 @@ async def contact_handler(msg: Message, state: FSMContext):
 
     raw = contact.phone_number or ""
     phone = clean_phone_number(raw) or (f"+{raw}" if not str(raw).startswith("+") else str(raw))
-    db.update_user_phone(uid, phone)
+    
+    try:
+        db.update_user_phone(uid, phone)
+    except Exception as err:
+        logger.error(f"update_user_phone xatosi: {err}")
 
-    is_sub, _ = await check_user_subscribed(uid)
-    if is_sub:
-        await reward_referral_if_eligible(uid)
-
+    # 1. FOYDALANUVCHIGA DARHOL JAVOB BERIB ASOSIY MENYUNI OCHAMIZ
     await msg.answer(
         f"✅ <b>TELEFON RAQAMINGIZ TASDIQLANDI!</b>\n"
         f"📱 Raqam: <code>{phone}</code>\n\n"
         f"Kafil botining barcha imkoniyatlaridan to'liq va xavfsiz foydalanishingiz mumkin.",
         reply_markup=main_menu_keyboard(uid)
     )
+
+    # 2. Referal mukofotini xavfsiz hisoblaymiz (foydalanuvchiga ta'sir qilmaydi)
+    try:
+        await reward_referral_if_eligible(uid)
+    except Exception as exc:
+        logger.error(f"Referal mukofotlash xatosi: {exc}")
 
 @router.message(StateFilter("*"), lambda m: is_user_unverified(m) and bool(m.text and not m.text.startswith("/")))
 async def unverified_user_text_phone_handler(msg: Message, state: FSMContext):
@@ -1064,17 +1079,24 @@ async def unverified_user_text_phone_handler(msg: Message, state: FSMContext):
     phone = clean_phone_number(raw_text)
     if phone:
         await state.clear()
-        db.update_user_phone(uid, phone)
-        is_sub, _ = await check_user_subscribed(uid)
-        if is_sub:
-            await reward_referral_if_eligible(uid)
+        try:
+            db.update_user_phone(uid, phone)
+        except Exception as err:
+            logger.error(f"update_user_phone xatosi: {err}")
 
+        # 1. DARHOL Asosiy menyuni ochamiz
         await msg.answer(
             f"✅ <b>TELEFON RAQAMINGIZ TASDIQLANDI!</b>\n"
             f"📱 Raqam: <code>{phone}</code>\n\n"
             f"Kafil botining barcha imkoniyatlaridan to'liq va xavfsiz foydalanishingiz mumkin.",
             reply_markup=main_menu_keyboard(uid)
         )
+
+        # 2. Referal mukofotini xavfsiz hisoblaymiz
+        try:
+            await reward_referral_if_eligible(uid)
+        except Exception as exc:
+            logger.error(f"Referal mukofotlash xatosi: {exc}")
         return
 
     phone_kb = ReplyKeyboardMarkup(

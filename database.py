@@ -56,6 +56,7 @@ def init_db():
         referral_balance INTEGER DEFAULT 0,
         referred_by INTEGER DEFAULT NULL,
         is_banned INTEGER DEFAULT 0,
+        phone_number TEXT DEFAULT NULL,
         created_at TEXT
     )
     """)
