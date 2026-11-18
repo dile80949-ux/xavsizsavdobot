@@ -152,7 +152,7 @@ def main_menu_keyboard(user_id: int) -> ReplyKeyboardMarkup:
     ]
     # Faqat va faqat haqiqiy bot adminlariga alohida qatorda Admin Panel tugmasi ko'rsatiladi
     if is_admin(user_id):
-        kb.append([KeyboardButton(text="👑 𝗔𝗱𝗺𝗶𝗻 𝗣𝗮𝗻𝗲𝗹")])
+        kb.append([KeyboardButton(text="🌟 𝗔𝗱𝗺𝗶𝗻 𝗣𝗮𝗻𝗲𝗹")])
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 # ============================ 3. FSM HOLATLARI ============================
@@ -2362,8 +2362,10 @@ async def admin_panel_handler(msg: Message, state: FSMContext):
     proofs_ch = db.get_setting("proofs_channel_link", "") or db.get_setting("proofs_channel_id", "")
     proofs_display = f"<a href='{proofs_ch}'>Ulangan</a>" if proofs_ch.startswith("http") else (f"@{proofs_ch.lstrip('@')}" if proofs_ch.startswith("@") else (proofs_ch if proofs_ch else "Ulanmagan"))
 
+    admin_anim_emoji = '<tg-emoji emoji-id="6046154264353442824">🌟</tg-emoji>'
+
     text = (
-        f"👑 <b>BOSH ADMIN BOSHQARUV MARKAZI</b>\n"
+        f"{admin_anim_emoji} <b>BOSH ADMIN BOSHQARUV MARKAZI</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"👤 <b>Hozirgi Admin user:</b> <b>{admin_display}</b>\n"
         f"📢 <b>Isbotlar kanali:</b> <b>{proofs_display}</b>\n\n"
@@ -2391,7 +2393,16 @@ async def admin_panel_handler(msg: Message, state: FSMContext):
         [InlineKeyboardButton(text="👤 𝗔𝗱𝗺𝗶𝗻 𝘂𝘀𝗲𝗿 𝗮𝗹𝗺𝗮𝘀𝗵𝘁𝗶𝗿𝗶𝘀𝗵", callback_data="adm_edit_admin_user"),
          InlineKeyboardButton(text="📢 𝗜𝘀𝗯𝗼𝘁𝗹𝗮𝗿 𝗸𝗮𝗻𝗮𝗹𝗶", callback_data="adm_edit_proofs_channel")]
     ]
-    await msg.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    admin_video_id = "BAACAgEAAxkBAAEwpF1q_d4QPpxhtyv6sMqMKTNYM-9vKQAC8AQAApD_uUVGP4KdaHkpDz0E"
+    try:
+        await msg.answer_video(
+            video=admin_video_id,
+            caption=text,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
+        )
+    except Exception as e:
+        logger.warning(f"Admin panel video yuborishda xato: {e}")
+        await msg.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
 @router.callback_query(F.data == "adm_view_deals")
 async def adm_view_deals_cb(call: CallbackQuery):
