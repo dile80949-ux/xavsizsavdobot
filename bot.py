@@ -934,7 +934,9 @@ async def start_cmd(msg: Message, state: FSMContext):
             f"Assalomu alaykum, <b>{esc_html(full_name)}</b>!\n\n"
             f"Kafillik xizmati xavfsizligini ta'minlash va firibgarlikning oldini olish uchun "
             f"telefon raqamingizni tasdiqlashingiz shart.\n\n"
-            f"👇 <i>Pastdagi '📱 Telefon raqamni yuborish' tugmasini bosing:</i>",
+            f"👇 <b>Raqamingizni quyidagi 2 usuldan biri orqali tasdiqlang:</b>\n"
+            f"1️⃣ Pastdagi <b>«📱 Telefon raqamni yuborish»</b> tugmasini bosing;\n"
+            f"2️⃣ Yoki raqamingizni yozib yuboring (Masalan: <code>+998901234567</code> yoki <code>901234567</code>).",
             reply_markup=phone_kb
         )
         return
@@ -992,7 +994,9 @@ async def callback_check_sub(call: CallbackQuery):
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"Kanallarga muvaffaqiyatli a'zo bo'ldingiz!\n\n"
             f"Kafillik xizmati xavfsizligini ta'minlash uchun telefon raqamingizni tasdiqlang.\n\n"
-            f"👇 <i>Pastdagi '📱 Telefon raqamni yuborish' tugmasini bosing:</i>",
+            f"👇 <b>Raqamingizni quyidagi 2 usuldan biri orqali tasdiqlang:</b>\n"
+            f"1️⃣ Pastdagi <b>«📱 Telefon raqamni yuborish»</b> tugmasini bosing;\n"
+            f"2️⃣ Yoki raqamingizni yozib yuboring (Masalan: <code>+998901234567</code> yoki <code>901234567</code>).",
             reply_markup=phone_kb
         )
         return
@@ -1008,7 +1012,28 @@ async def callback_check_sub(call: CallbackQuery):
         reply_markup=main_menu_keyboard(uid)
     )
 
-@router.message(F.contact)
+def clean_phone_number(raw: str) -> Optional[str]:
+    """Tozalangan va xalqaro formatdagi telefon raqamini qaytaradi."""
+    if not raw:
+        return None
+    digits = re.sub(r"\D", "", str(raw))
+    if not digits:
+        return None
+    if len(digits) == 9:
+        return f"+998{digits}"
+    if len(digits) == 12 and digits.startswith("998"):
+        return f"+{digits}"
+    if 7 <= len(digits) <= 15:
+        return f"+{digits}"
+    return None
+
+def is_user_unverified(msg: Message) -> bool:
+    if not msg.from_user:
+        return False
+    u = db.get_user(msg.from_user.id)
+    return not (u and u["phone_number"])
+
+@router.message(StateFilter("*"), F.contact)
 async def contact_handler(msg: Message, state: FSMContext):
     await state.clear()
     uid = msg.from_user.id
@@ -1016,10 +1041,8 @@ async def contact_handler(msg: Message, state: FSMContext):
     if not contact:
         return
 
-    phone = contact.phone_number
-    if not phone.startswith("+"):
-        phone = f"+{phone}"
-
+    raw = contact.phone_number or ""
+    phone = clean_phone_number(raw) or (f"+{raw}" if not str(raw).startswith("+") else str(raw))
     db.update_user_phone(uid, phone)
 
     is_sub, _ = await check_user_subscribed(uid)
@@ -1031,6 +1054,42 @@ async def contact_handler(msg: Message, state: FSMContext):
         f"📱 Raqam: <code>{phone}</code>\n\n"
         f"Kafil botining barcha imkoniyatlaridan to'liq va xavfsiz foydalanishingiz mumkin.",
         reply_markup=main_menu_keyboard(uid)
+    )
+
+@router.message(StateFilter("*"), lambda m: is_user_unverified(m) and bool(m.text and not m.text.startswith("/")))
+async def unverified_user_text_phone_handler(msg: Message, state: FSMContext):
+    uid = msg.from_user.id
+    raw_text = (msg.text or "").strip()
+
+    phone = clean_phone_number(raw_text)
+    if phone:
+        await state.clear()
+        db.update_user_phone(uid, phone)
+        is_sub, _ = await check_user_subscribed(uid)
+        if is_sub:
+            await reward_referral_if_eligible(uid)
+
+        await msg.answer(
+            f"✅ <b>TELEFON RAQAMINGIZ TASDIQLANDI!</b>\n"
+            f"📱 Raqam: <code>{phone}</code>\n\n"
+            f"Kafil botining barcha imkoniyatlaridan to'liq va xavfsiz foydalanishingiz mumkin.",
+            reply_markup=main_menu_keyboard(uid)
+        )
+        return
+
+    phone_kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📱 Telefon raqamni yuborish", request_contact=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+    await msg.answer(
+        "📱 <b>TELEFON RAQAMINGIZNI TASDIQLANG:</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Botdan foydalanish uchun telefon raqamingizni tasdiqlashingiz shart.\n\n"
+        "1️⃣ Pastdagi <b>«📱 Telefon raqamni yuborish»</b> tugmasini bosing;\n"
+        "2️⃣ Yoki raqamingizni chatga yozib yuboring:\n"
+        "👉 Masalan: <code>+998901234567</code> yoki <code>901234567</code>",
+        reply_markup=phone_kb
     )
 
 # ============================ 8. 1-TUGMA: 📜 TARIX ============================
