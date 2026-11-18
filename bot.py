@@ -148,8 +148,11 @@ def main_menu_keyboard(user_id: int) -> ReplyKeyboardMarkup:
         [KeyboardButton(text="📜 𝗧𝗮𝗿𝗶𝘅"), KeyboardButton(text="🆘 𝗦𝗢𝗦 (𝗬𝗼𝗿𝗱𝗮𝗺)")],
         [KeyboardButton(text="👥 𝗥𝗲𝗳𝗲𝗿𝗮𝗹 𝗧𝗶𝘇𝗶𝗺𝗶"), KeyboardButton(text="🤝 𝗬𝗮𝗻𝗴𝗶 𝗦𝗮𝘃𝗱𝗼 𝗢𝗰𝗵𝗶𝘀𝗵")],
         [KeyboardButton(text="🚫 𝗙𝗶𝗿𝗶𝗯𝗴𝗮𝗿𝗹𝗮𝗿 𝗥𝗼'𝘆𝘅𝗮𝘁𝗶"), KeyboardButton(text="💾 𝗭𝗮𝘅𝗶𝗿𝗮 𝗡𝘂𝘀𝘅𝗮 (𝗕𝗮𝗰𝗸𝘂𝗽)")],
-        [KeyboardButton(text="📑 𝗔𝗿𝗶𝘇𝗮𝗹𝗮𝗿𝗶𝗺"), KeyboardButton(text="👑 𝗔𝗱𝗺𝗶𝗻 𝗣𝗮𝗻𝗲𝗹")]
+        [KeyboardButton(text="📑 𝗔𝗿𝗶𝘇𝗮𝗹𝗮𝗿𝗶𝗺"), KeyboardButton(text="📊 𝗜𝘀𝗯𝗼𝘁𝗹𝗮𝗿")]
     ]
+    # Faqat va faqat haqiqiy bot adminlariga alohida qatorda Admin Panel tugmasi ko'rsatiladi
+    if is_admin(user_id):
+        kb.append([KeyboardButton(text="👑 𝗔𝗱𝗺𝗶𝗻 𝗣𝗮𝗻𝗲𝗹")])
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 # ============================ 3. FSM HOLATLARI ============================
@@ -183,6 +186,8 @@ class AdminFSM(StatesGroup):
     change_card = State()
     change_owner = State()
     change_commission = State()
+    change_admin_user = State()
+    change_proofs_channel = State()
     ai_chat = State()
     reply_ticket_id = State()
     reply_ticket_text = State()
@@ -340,6 +345,90 @@ async def penalize_referral_if_left(user_id: int):
         )
     except Exception:
         pass
+
+# ============================ ISBOTLAR KANALI YORDAMCHILARI ============================
+def mask_card_for_proof(card_str: str) -> str:
+    raw = re.sub(r"\D", "", card_str or "")
+    if len(raw) == 16:
+        return f"{raw[:4]} **** **** **{raw[-2:]}"
+    elif len(raw) >= 4:
+        return f"{raw[:4]} **** **{raw[-2:]}"
+    return "**** **"
+
+def mask_name_for_proof(name_str: str) -> str:
+    parts = (name_str or "").strip().split()
+    if not parts:
+        return "F*******"
+    masked = []
+    for p in parts:
+        if len(p) <= 1:
+            masked.append(p + "*")
+        else:
+            masked.append(p[0].upper() + "*" * (len(p) - 1))
+    return " ".join(masked)
+
+async def post_deal_receipt_to_proofs_channel(deal: dict, now_str: str):
+    cid = db.get_setting("proofs_channel_id", "")
+    if not cid:
+        return
+    try:
+        chat_id = int(cid) if str(cid).lstrip("-").isdigit() else cid
+        bot_info = await bot.get_me()
+        bot_un = f"@{bot_info.username}" if bot_info and bot_info.username else "@Xavsizsavdobot"
+
+        masked_card = mask_card_for_proof(deal.get("seller_card") or "")
+        masked_name = mask_name_for_proof(deal.get("seller_card_owner") or "")
+        amt_f = fmt(deal.get("amount", 0))
+        d_id = deal.get("deal_id", "")
+        title = deal.get("title", "Mahsulot")
+
+        text = (
+            f"🧾 <b>RASMIY TO'LOV CHEKI / KAFOLAT ISBOTI</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>[ ✅ TO'LOV MUVAFFAQIYATLI O'TKAZILDI ]</b>\n\n"
+            f"💰 <b>To'lov summasi:</b> <b>{amt_f} so'm</b>\n"
+            f"💳 <b>Qabul qiluvchi karta:</b> <code>{masked_card}</code>\n"
+            f"👤 <b>Karta egasi:</b> <b>{masked_name}</b>\n"
+            f"📦 <b>Savdo obyekti:</b> <b>{esc_html(title)}</b>\n"
+            f"🆔 <b>Bitim raqami:</b> #{d_id}\n"
+            f"📅 <b>Tasdiqlangan sana va vaqt:</b> <code>{now_str}</code>\n"
+            f"🤖 <b>Kafillik xizmati:</b> {bot_un}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🛡 <i>Garant Admini kelishilgan mablag'ni sotuvchiga to'liq o'tkazib berdi. Savdo 100% xavfsiz yakunlandi!</i>"
+        )
+        await bot.send_message(chat_id, text)
+    except Exception as e:
+        logger.warning(f"Isbotlar kanaliga chek yuborishda xato: {e}")
+
+async def post_blacklist_to_proofs_channel(user_id: Optional[int], username: Optional[str], reason: str):
+    cid = db.get_setting("proofs_channel_id", "")
+    if not cid:
+        return
+    try:
+        chat_id = int(cid) if str(cid).lstrip("-").isdigit() else cid
+        now_str = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+        bot_info = await bot.get_me()
+        bot_un = f"@{bot_info.username}" if bot_info and bot_info.username else "@Xavsizsavdobot"
+
+        u_tag = f"@{username.lstrip('@')}" if username else "Mavjud emas"
+        id_str = str(user_id) if user_id else "Mavjud emas"
+
+        text = (
+            f"🚨 <b>DIQQAT! FIRIBGARLIK HAQIDA OGOHLANTIRISH!</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>[ 🚫 QORA RO'YXATGA KIRITILDI ]</b>\n\n"
+            f"👤 <b>Foydalanuvchi:</b> {u_tag}\n"
+            f"🆔 <b>Telegram ID:</b> <code>{id_str}</code>\n"
+            f"⚠️ <b>Sabab:</b> <i>{esc_html(reason)}</i>\n"
+            f"📅 <b>Sana va vaqt:</b> <code>{now_str}</code>\n"
+            f"🤖 <b>Kafillik xizmati:</b> {bot_un}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚠️ <b>OGOHLANTIRISH:</b> Ushbu foydalanuvchi bilan savdo qilmang va undan uzoq yuring! Firibgarlardan ehtiyot bo'ling.\n"
+            f"🛡 <i>Garant xizmati sizning mablag'ingizni 100% xavfsiz saqlaydi.</i>"
+        )
+        await bot.send_message(chat_id, text)
+    except Exception as e:
+        logger.warning(f"Isbotlar kanaliga firibgar yuborishda xato: {e}")
 
 # ============================ 6. ASINXRON FON TAYMERLARI ============================
 async def activate_paid_deal(deal_id: str, edit_call: Optional[CallbackQuery] = None, state: Optional[FSMContext] = None) -> bool:
@@ -538,6 +627,14 @@ async def complaints_auto_expire_loop():
                     deal_id=c["deal_id"] or "",
                     added_by="complaint_deadline"
                 )
+                try:
+                    await post_blacklist_to_proofs_channel(
+                        user_id=c["accused_id"],
+                        username=c["accused_username"],
+                        reason=f"Ariza #{c['id']} bo'yicha 5 kunda javob bermagan: {c['reason']}"
+                    )
+                except Exception:
+                    pass
                 try:
                     await bot.send_message(
                         c["complainant_id"],
@@ -1020,12 +1117,26 @@ async def fwd_admin_cb(call: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "sos_contact_admin")
 async def sos_contact_admin_cb(call: CallbackQuery):
     await call.answer()
-    admin_id = ADMIN_IDS[0] if ADMIN_IDS else 6125160021
+    admin_un = db.get_setting("admin_username", "")
+    admin_id_s = db.get_setting("admin_id", "")
+
+    if admin_un:
+        clean_un = admin_un.lstrip("@")
+        admin_link = f"https://t.me/{clean_un}"
+        admin_display = f"@{clean_un}"
+    elif admin_id_s and admin_id_s.isdigit():
+        admin_link = f"tg://user?id={admin_id_s}"
+        admin_display = "Rasmiy Garant Admin"
+    else:
+        admin_id = ADMIN_IDS[0] if ADMIN_IDS else 6125160021
+        admin_link = f"tg://user?id={admin_id}"
+        admin_display = "Rasmiy Garant Admin"
+
     await call.message.answer(
         f"📞 <b>ADMIN BILAN TO'G'RIDAN-TO'G'RI BOG'LANISH:</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"Garant admin bilan to'g'ridan-to'g'ri bog'lanish uchun havola:\n"
-        f"👉 <a href=\"tg://user?id={admin_id}\">Rasmiy Garant Admin</a>",
+        f"👉 <a href=\"{admin_link}\">{admin_display}</a>",
         disable_web_page_preview=True
     )
 
@@ -1806,16 +1917,7 @@ async def group_trade_moderator(msg: Message):
 
     # 2. Oluvchi arizasini tekshirish
     if deal["status"] == "buyer_statement" and is_buyer:
-        t_low = text.lower()
-        has_approval = any(w in t_low for w in ["qabul qilib oldim", "qabul qildim", "da'voyim yo'q", "davoyim yoq", "bot javob bermaydi", "hech qanday da'vo", "e'tirozim yo'q", "etirozim yoq"])
-
-        is_valid_stmt = False
-        stmt_summary = ""
-        if has_approval and len(text.strip()) >= 20:
-            is_valid_stmt = True
-            stmt_summary = "✅ Oluvchi arizasi qabul qilindi."
-        else:
-            is_valid_stmt, stmt_summary = await verify_statement_with_ai_async(text, "buyer", deal)
+        is_valid_stmt, stmt_summary = await verify_statement_with_ai_async(text, "buyer", deal)
 
         if is_valid_stmt:
             db.q("UPDATE deals SET buyer_statement=?, status='seller_statement' WHERE deal_id=?", (text, deal["deal_id"]), commit=True)
@@ -1828,7 +1930,8 @@ async def group_trade_moderator(msg: Message):
             return
         else:
             await msg.reply(
-                f"❌ <b>Arizangiz qabul qilinmadi (Noto'g'ri yozildi)!</b>\n\n"
+                f"❌ <b>Arizangiz qabul qilinmadi (Xatolik yoki rad etish aniqlandi)!</b>\n\n"
+                f"{stmt_summary}\n\n"
                 f"Iltimos, arizani namunadagidek to'g'ri va to'liq qilib qaytadan yozing (ustiga bossangiz nusxalanadi):\n\n"
                 f"✍️ <code>{esc_html(sample_buyer_stmt)}</code>"
             )
@@ -1836,16 +1939,7 @@ async def group_trade_moderator(msg: Message):
 
     # 3. Sotuvchi kafolat arizasini tekshirish
     if deal["status"] == "seller_statement" and is_seller:
-        t_low = text.lower()
-        has_warranty = any(w in t_low for w in ["qora ro'yxat", "qora royxat", "qaytarib olsam", "aldov qilsam", "aldamayman", "javobgarlik", "kafolat beraman", "roziman va"])
-
-        is_valid_stmt = False
-        stmt_summary = ""
-        if has_warranty and len(text.strip()) >= 20:
-            is_valid_stmt = True
-            stmt_summary = "✅ Sotuvchi kafolat arizasi qabul qilindi."
-        else:
-            is_valid_stmt, stmt_summary = await verify_statement_with_ai_async(text, "seller", deal)
+        is_valid_stmt, stmt_summary = await verify_statement_with_ai_async(text, "seller", deal)
 
         if is_valid_stmt:
             db.q("UPDATE deals SET seller_statement=?, status='waiting_seller_card' WHERE deal_id=?", (text, deal["deal_id"]), commit=True)
@@ -1866,6 +1960,14 @@ async def group_trade_moderator(msg: Message):
                             deal_id=deal["deal_id"],
                             added_by="AI_Chat_Guardian"
                         )
+                        try:
+                            await post_blacklist_to_proofs_channel(
+                                user_id=int(bad_id.strip()),
+                                username=bad_un,
+                                reason=f"Savdo #{deal['deal_id']} chatida so'kingan va qoidalarni buzgan"
+                            )
+                        except Exception:
+                            pass
 
             bot_info = await bot.get_me()
             bot_un = f"@{bot_info.username}" if bot_info and bot_info.username else "@Xavsizsavdobot"
@@ -1893,13 +1995,23 @@ async def group_trade_moderator(msg: Message):
         else:
             await msg.reply(
                 f"❌ <b>Kafolat arizangiz qabul qilinmadi (Noto'g'ri yozildi)!</b>\n\n"
+                f"{stmt_summary}\n\n"
                 f"Iltimos, namunadagidek to'g'ri va to'liq qilib qaytadan yozing (ustiga bossangiz nusxalanadi):\n\n"
                 f"✍️ <code>{esc_html(sample_seller_stmt)}</code>"
             )
             return
 
     # 4. Sotuvchi shablonni to'ldirib yuborganda
-    if deal["status"] in ("waiting_seller_card", "completed") and is_seller and (not deal.get("seller_card") or deal.get("admin_payout_status") != "paid"):
+    if deal["status"] in ("waiting_seller_card", "completed") and is_seller:
+        # Karta allaqachon yuborilgan bo'lsa - faqat bir marta yuboriladi, adminga qayta yuborilmaydi
+        if deal.get("seller_card"):
+            await msg.reply(
+                "ℹ️ <b>Sizning to'lov rekvizitlaringiz allaqachon qabul qilingan va adminga yuborilgan!</b>\n"
+                "Admin to'lovni o'tkazishi bilan sizga rasmiy to'lov cheki yuboriladi. "
+                "Iltimos, qayta yubormang va to'lovni kuting."
+            )
+            return
+
         card_num, owner_name, id_val, err = parse_seller_card_submission(text, msg.from_user.id)
         bot_info = await bot.get_me()
         bot_un = f"@{bot_info.username}" if bot_info and bot_info.username else "@Xavsizsavdobot"
@@ -2012,6 +2124,14 @@ async def scam_confirm_cb(call: CallbackQuery):
         deal_id=d_id,
         added_by="group_monitor"
     )
+    try:
+        await post_blacklist_to_proofs_channel(
+            user_id=seller_uid,
+            username=deal["seller_username"],
+            reason=f"Guruhdagi savdoni tugatmay qochib ketgan (Bitim #{d_id})"
+        )
+    except Exception:
+        pass
     now_s = datetime.now(TZ).isoformat()
     db.q("UPDATE deals SET status='dispute', updated_at=? WHERE deal_id=?", (now_s, d_id), commit=True)
 
@@ -2177,42 +2297,48 @@ async def withdraw_comp_cb(call: CallbackQuery):
         except Exception:
             pass
 
+# ============================ 15b. 📊 ISBOTLAR KANALI ============================
+@router.message(StateFilter("*"), F.text.contains("Isbotlar") | F.text.contains("𝗜𝘀𝗯𝗼𝘁𝗹𝗮𝗿"))
+async def proofs_channel_btn_handler(msg: Message, state: FSMContext):
+    await state.clear()
+    uid = msg.from_user.id
+    ch_link = db.get_setting("proofs_channel_link", "")
+    ch_id = db.get_setting("proofs_channel_id", "")
+    ch_title = db.get_setting("proofs_channel_title", "Rasmiy Isbotlar Kanali")
+
+    if ch_link:
+        kb = [[InlineKeyboardButton(text="📢 𝗜𝘀𝗯𝗼𝘁𝗹𝗮𝗿 𝗸𝗮𝗻𝗮𝗹𝗶𝗴𝗮 𝗼'𝘁𝗶𝘀𝗵", url=ch_link)]]
+        text = (
+            f"📊 <b>KAFOLAT VA TO'LOV ISBOTLARI KANALI</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🛡 Ushbu kanalda bizning kafil tizimimiz orqali muvaffaqiyatli yakunlangan barcha "
+            f"savdolarning rasmiy to'lov cheklari (karta raqamlari yashirilgan holda) va aniq sanasi joylab boriladi!\n\n"
+            f"🚫 Shuningdek, qoidabuzar va firibgar shaxslar haqidagi ogohlantirishlar ham e'lon qilinadi.\n\n"
+            f"👇 <i>Kanalga kirish uchun quyidagi tugmani bosing:</i>"
+        )
+        await msg.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    else:
+        text = (
+            f"📊 <b>KAFOLAT VA TO'LOV ISBOTLARI KANALI</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🛡 Ushbu kanalda barcha muvaffaqiyatli o'tkazilgan to'lov cheklari va firibgarlar ro'yxati e'lon qilib boriladi.\n\n"
+            f"ℹ️ <i>Hozirda isbotlar kanali administrator tomonidan sozlanmoqda. Tez orada kanal havolasi bu yerda faollashadi!</i>"
+        )
+        await msg.answer(text, reply_markup=main_menu_keyboard(uid))
+
 # ============================ 16. 8-TUGMA: 👑 ADMIN PANEL ============================
 @router.message(StateFilter("*"), Command("id"))
 async def get_my_id_cmd(msg: Message):
     uid = msg.from_user.id
     await msg.answer(f"🆔 <b>Sizning Telegram ID raqamingiz:</b> <code>{uid}</code>\n<i>(Nusxalash uchun ID ustiga bosing)</i>")
 
-@router.message(StateFilter("*"), Command("auth_admin"))
-async def auth_admin_cmd(msg: Message):
-    uid = msg.from_user.id
-    custom = db.get_setting("extra_admins", "")
-    admins_list = [x.strip() for x in custom.split(",") if x.strip()]
-    if str(uid) not in admins_list:
-        admins_list.append(str(uid))
-        db.set_setting("extra_admins", ",".join(admins_list))
-    await msg.answer(
-        f"✅ <b>Tabriklaymiz!</b> Siz (ID: <code>{uid}</code>) muvaffaqiyatli bot administratori qilib tayinlandingiz!\n\n"
-        f"Endi pastdagi «👑 𝗔𝗱𝗺𝗶𝗻 𝗣𝗮𝗻𝗲𝗹» tugmasini bosib boshqaruv paneliga kirishingiz mumkin.",
-        reply_markup=main_menu_keyboard(uid)
-    )
-
 @router.message(StateFilter("*"), Command("admin"))
 @router.message(StateFilter("*"), F.text.lower().contains("admin") | F.text.contains("𝗔𝗱𝗺𝗶𝗻"))
 async def admin_panel_handler(msg: Message, state: FSMContext):
     await state.clear()
     uid = msg.from_user.id
+    # Faqat va faqat haqiqiy bot adminlariga ruxsat beriladi
     if not is_admin(uid):
-        await msg.answer(
-            f"👑 <b>ADMIN BOSHQARUV PANELI</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"⚠️ <b>Kechirasiz, siz ushbu botning administratori emassiz!</b>\n\n"
-            f"🆔 <b>Sizning Telegram ID raqamingiz:</b> <code>{uid}</code>\n"
-            f"<i>(ID ustiga bosing — avtomatik nusxalanadi)</i>\n\n"
-            f"📌 <b>Admin huquqini darhol faollashtirish uchun:</b>\n"
-            f"Botga <code>/auth_admin</code> buyrug'ini yuboring.",
-            reply_markup=main_menu_keyboard(uid)
-        )
         return
 
     total_u = db.q("SELECT COUNT(*) c FROM users", one=True)["c"]
@@ -2224,9 +2350,23 @@ async def admin_panel_handler(msg: Message, state: FSMContext):
     owner = db.get_setting("card_owner", DEFAULT_CARD_OWNER)
     comm = db.get_setting("commission_percent", "10")
 
+    admin_u = db.get_setting("admin_username", "")
+    admin_id_s = db.get_setting("admin_id", "")
+    if admin_u:
+        admin_display = f"@{admin_u.lstrip('@')}"
+    elif admin_id_s:
+        admin_display = f"ID: {admin_id_s}"
+    else:
+        admin_display = f"ID: {ADMIN_IDS[0]}"
+
+    proofs_ch = db.get_setting("proofs_channel_link", "") or db.get_setting("proofs_channel_id", "")
+    proofs_display = f"<a href='{proofs_ch}'>Ulangan</a>" if proofs_ch.startswith("http") else (f"@{proofs_ch.lstrip('@')}" if proofs_ch.startswith("@") else (proofs_ch if proofs_ch else "Ulanmagan"))
+
     text = (
         f"👑 <b>BOSH ADMIN BOSHQARUV MARKAZI</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 <b>Hozirgi Admin user:</b> <b>{admin_display}</b>\n"
+        f"📢 <b>Isbotlar kanali:</b> <b>{proofs_display}</b>\n\n"
         f"📊 <b>TIZIMNING UMUMIY STATISTIKASI:</b>\n"
         f"├ 👥 <b>Foydalanuvchilar:</b> <b>{total_u} ta</b>\n"
         f"├ 📦 <b>Jami amalga oshgan bitimlar:</b> <b>{total_d} ta</b>\n"
@@ -2247,7 +2387,9 @@ async def admin_panel_handler(msg: Message, state: FSMContext):
         [InlineKeyboardButton(text="📊 𝗔𝗜 𝗧𝗮𝗵𝗹𝗶𝗹𝗶𝘆 𝗵𝗶𝘀𝗼𝗯𝗼𝘁", callback_data="adm_ai_chat"),
          InlineKeyboardButton(text="💸 𝗥𝗲𝗳𝗲𝗿𝗮𝗹 𝘀𝗼'𝗿𝗼𝘃𝗹𝗮𝗿𝗶", callback_data="adm_withdrawals")],
         [InlineKeyboardButton(text="💳 𝗞𝗮𝗿𝘁𝗮 𝘀𝗼𝘇𝗹𝗮𝘀𝗵", callback_data="adm_edit_card"),
-         InlineKeyboardButton(text="💼 𝗞𝗼𝗺𝗶𝘀𝘀𝗶𝘆𝗮 𝘀𝗼𝘇𝗹𝗮𝘀𝗵", callback_data="adm_edit_pct")]
+         InlineKeyboardButton(text="💼 𝗞𝗼𝗺𝗶𝘀𝘀𝗶𝘆𝗮 𝘀𝗼𝘇𝗹𝗮𝘀𝗵", callback_data="adm_edit_pct")],
+        [InlineKeyboardButton(text="👤 𝗔𝗱𝗺𝗶𝗻 𝘂𝘀𝗲𝗿 𝗮𝗹𝗺𝗮𝘀𝗵𝘁𝗶𝗿𝗶𝘀𝗵", callback_data="adm_edit_admin_user"),
+         InlineKeyboardButton(text="📢 𝗜𝘀𝗯𝗼𝘁𝗹𝗮𝗿 𝗸𝗮𝗻𝗮𝗹𝗶", callback_data="adm_edit_proofs_channel")]
     ]
     await msg.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
@@ -2295,6 +2437,10 @@ async def adm_proc_scammer_reason(msg: Message, state: FSMContext):
     uid = int(target) if target.isdigit() else None
     un = target if not target.isdigit() else ""
     db.add_to_blacklist(user_id=uid, username=un, reason=reason, added_by="admin")
+    try:
+        await post_blacklist_to_proofs_channel(user_id=uid, username=un, reason=reason)
+    except Exception:
+        pass
     await msg.answer(f"✅ <b>{target}</b> qora ro'yxatga qo'shildi va bloklandi.")
 
 @router.callback_query(F.data == "adm_list_scammers")
@@ -2541,6 +2687,12 @@ async def adm_paid_seller_cb(call: CallbackQuery):
         except Exception as e:
             logger.warning(f"Sotuvchiga chek yuborishda xato: {e}")
 
+    # Isbotlar kanaliga to'lov chekini avtomatik joylash
+    try:
+        await post_deal_receipt_to_proofs_channel(deal, now_str)
+    except Exception:
+        pass
+
     try:
         await call.message.edit_text(
             call.message.html_text + f"\n\n✅ <b>ADMIN TASDIQLADI:</b> Pul sotuvchi kartasiga o'tkazildi va rasmiy chek yuborildi!\n📅 {now_str}",
@@ -2663,6 +2815,138 @@ async def adm_proc_new_pct(msg: Message, state: FSMContext):
     await state.clear()
     await msg.answer(f"✅ Komissiya foizi {txt}% ga o'zgartirildi.")
 
+@router.callback_query(F.data == "adm_edit_admin_user")
+async def adm_edit_admin_user_cb(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        await call.answer("Ruxsat berilmagan!", show_alert=True)
+        return
+    await call.answer()
+    await state.set_state(AdminFSM.change_admin_user)
+    curr = db.get_setting("admin_username", "")
+    curr_id = db.get_setting("admin_id", "")
+    curr_text = f"@{curr.lstrip('@')}" if curr else (f"ID: {curr_id}" if curr_id else f"ID: {ADMIN_IDS[0]}")
+    await call.message.answer(
+        f"👤 <b>ADMIN USERNI ALMASHTIRISH:</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Hozirgi asosiy admin: <b>{curr_text}</b>\n\n"
+        f"Yangi admin foydalanuvchisini kiriting:\n"
+        f"• Telegram @username (masalan: <code>@yangi_admin</code>)\n"
+        f"• Yoki Telegram ID raqami (masalan: <code>6125160021</code>)\n\n"
+        f"<i>Ushbu sozlama barcha joylarda (SOS bo'limi, murojaatlar, aloqa) avtomatik o'zgaradi.</i>",
+        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Bekor qilish")]], resize_keyboard=True)
+    )
+
+@router.message(AdminFSM.change_admin_user)
+async def adm_proc_change_admin_user(msg: Message, state: FSMContext):
+    if any(w in msg.text.lower() for w in ["bekor", "cancel"]) or msg.text.startswith("❌"):
+        await state.clear()
+        await msg.answer("Bekor qilindi.", reply_markup=main_menu_keyboard(msg.from_user.id))
+        return
+
+    raw = msg.text.strip()
+    clean = raw.lstrip("@").strip()
+
+    if clean.isdigit():
+        new_id = int(clean)
+        custom = db.get_setting("extra_admins", "")
+        admins_list = [x.strip() for x in custom.split(",") if x.strip()]
+        if str(new_id) not in admins_list:
+            admins_list.append(str(new_id))
+            db.set_setting("extra_admins", ",".join(admins_list))
+        db.set_setting("admin_id", str(new_id))
+        res_text = f"Telegram ID: <code>{new_id}</code>"
+    else:
+        db.set_setting("admin_username", clean)
+        res_text = f"@{clean}"
+
+    await state.clear()
+    await msg.answer(
+        f"✅ <b>Admin user muvaffaqiyatli almashtirildi!</b>\n\n"
+        f"Yangi admin: <b>{res_text}</b>\n"
+        f"Endi botning barcha bo'limlarida ushbu yangi admin ko'rsatiladi.",
+        reply_markup=main_menu_keyboard(msg.from_user.id)
+    )
+
+@router.callback_query(F.data == "adm_edit_proofs_channel")
+async def adm_edit_proofs_channel_cb(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        await call.answer("Ruxsat berilmagan!", show_alert=True)
+        return
+    await call.answer()
+    await state.set_state(AdminFSM.change_proofs_channel)
+    curr_link = db.get_setting("proofs_channel_link", "")
+    curr_id = db.get_setting("proofs_channel_id", "")
+    curr_text = curr_link or (f"ID: {curr_id}" if curr_id else "Ulanmagan")
+    await call.message.answer(
+        f"📢 <b>ISBOTLAR KANALINI SOZLASH:</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Hozirgi kanal: <b>{curr_text}</b>\n\n"
+        f"📌 <b>Qo'llanma:</b>\n"
+        f"1. Yangi kanal oching (yoki mavjud kanaldan foydalaning).\n"
+        f"2. Botni ushbu kanalga <b>ADMINISTRATOR</b> qilib qo'shing (xabar yozish huquqi bilan).\n"
+        f"3. Kanalning <b>@username</b> manzilini (masalan: <code>@mening_isbotlarim</code>) yoki ID raqamini (masalan: <code>-1001234567890</code>) bu yerga yuboring.\n\n"
+        f"<i>Bot ushbu kanalga to'lov cheklari va qora ro'yxatdagilarni avtomatik joylab boradi.</i>",
+        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Bekor qilish")]], resize_keyboard=True)
+    )
+
+@router.message(AdminFSM.change_proofs_channel)
+async def adm_proc_change_proofs_channel(msg: Message, state: FSMContext):
+    if any(w in msg.text.lower() for w in ["bekor", "cancel"]) or msg.text.startswith("❌"):
+        await state.clear()
+        await msg.answer("Bekor qilindi.", reply_markup=main_menu_keyboard(msg.from_user.id))
+        return
+
+    raw = msg.text.strip()
+    clean_un = re.sub(r"^(https?:\/\/)?(www\.)?t\.me\/", "", raw).split('/')[0].split('?')[0].lstrip('@').strip()
+
+    if raw.startswith("-100") or (raw.startswith("-") and raw[1:].isdigit()):
+        target = int(raw)
+    elif raw.isdigit():
+        target = int(f"-100{raw}")
+    else:
+        target = f"@{clean_un}"
+
+    try:
+        chat = await bot.get_chat(target)
+        bot_member = await bot.get_chat_member(chat.id, bot.id)
+        if bot_member.status not in ("administrator", "creator"):
+            await msg.answer(
+                "❌ <b>Bot ushbu kanalda administrator emas!</b>\n\n"
+                "Iltimos, avval botni kanalga admin qilib qo'shing va xabar yuborish huquqini bering, so'ngra kanal manzilini qayta yuboring."
+            )
+            return
+
+        ch_id = str(chat.id)
+        ch_title = chat.title or "Isbotlar kanali"
+        if chat.username:
+            ch_link = f"https://t.me/{chat.username}"
+        else:
+            try:
+                invite = await bot.create_chat_invite_link(chat.id)
+                ch_link = invite.invite_link
+            except Exception:
+                ch_link = chat.invite_link or f"https://t.me/{clean_un}"
+
+        db.set_setting("proofs_channel_id", ch_id)
+        db.set_setting("proofs_channel_link", ch_link)
+        db.set_setting("proofs_channel_title", ch_title)
+
+        await state.clear()
+        await msg.answer(
+            f"✅ <b>Isbotlar kanali muvaffaqiyatli ulandi!</b>\n\n"
+            f"📢 <b>Kanal:</b> {esc_html(ch_title)}\n"
+            f"🔗 <b>Havola:</b> {ch_link}\n"
+            f"🆔 <b>Kanal ID:</b> <code>{ch_id}</code>\n\n"
+            f"Endi yakunlangan savdolar to'lov cheki va firibgarlar haqidagi ogohlantirishlar avtomatik shu kanalga joylanadi.",
+            reply_markup=main_menu_keyboard(msg.from_user.id)
+        )
+    except Exception as e:
+        logger.warning(f"Isbotlar kanalini ulashda xato: {e}")
+        await msg.answer(
+            f"❌ <b>Kanal topilmadi yoki xatolik yuz berdi:</b>\n<i>{esc_html(str(e))}</i>\n\n"
+            f"Iltimos, manzilni to'g'ri kiritganingizni va bot kanalga admin qilib qo'shilganini tekshirib qaytadan yuboring."
+        )
+
 # ============================ 17. BEKOR QILISH CALLBACK ============================
 @router.callback_query(F.data.startswith("cancel_deal:"))
 async def cancel_deal_cb(call: CallbackQuery):
@@ -2689,7 +2973,7 @@ async def private_trade_chat_router(msg: Message, state: FSMContext):
         return
 
     # Asosiy menyu tugmalari bo'lsa o'tkazib yuborish
-    if any(k in msg.text for k in ["Tarix", "SOS", "Yordam", "Referal", "Savdo", "Firibgar", "Backup", "Zaxira", "Ariza", "Admin", "Bekor"]):
+    if any(k in msg.text for k in ["Tarix", "SOS", "Yordam", "Referal", "Savdo", "Firibgar", "Backup", "Zaxira", "Ariza", "Admin", "Bekor", "Isbot", "𝗜𝘀𝗯𝗼𝘁"]):
         return
 
     uid = msg.from_user.id
@@ -2755,16 +3039,7 @@ async def private_trade_chat_router(msg: Message, state: FSMContext):
         sample_buyer_stmt = f"Men {deal['title']}ni to'liq qabul qilib oldim, hech qanday da'voyim yo'q, agar keyinchalik muammo bo'lsa yoki sotuvchi qaytarib olsa, bot javob bermaydi"
         sample_seller_stmt = "Men agar sotilgan narsani qaytarib olsam yoki aldov qilsam, qora ro'yxatga solishingizga roziman va to'liq javobgarlikni bo'ynimga olaman"
 
-        t_low = text_content.lower()
-        has_approval = any(w in t_low for w in ["qabul qilib oldim", "qabul qildim", "da'voyim yo'q", "davoyim yoq", "bot javob bermaydi", "hech qanday da'vo", "e'tirozim yo'q", "etirozim yoq"])
-
-        is_valid_stmt = False
-        stmt_summary = ""
-        if has_approval and len(text_content.strip()) >= 20:
-            is_valid_stmt = True
-            stmt_summary = "✅ Oluvchi arizasi qabul qilindi."
-        else:
-            is_valid_stmt, stmt_summary = await verify_statement_with_ai_async(text_content, "buyer", deal)
+        is_valid_stmt, stmt_summary = await verify_statement_with_ai_async(text_content, "buyer", deal)
 
         if is_valid_stmt:
             db.q("UPDATE deals SET buyer_statement=?, status='seller_statement', updated_at=? WHERE deal_id=?", (text_content, now_s, deal["deal_id"]), commit=True)
@@ -2785,7 +3060,8 @@ async def private_trade_chat_router(msg: Message, state: FSMContext):
             return
         else:
             await msg.reply(
-                f"❌ <b>Arizangiz qabul qilinmadi (Noto'g'ri yozildi)!</b>\n\n"
+                f"❌ <b>Arizangiz qabul qilinmadi (Xatolik yoki rad etish aniqlandi)!</b>\n\n"
+                f"{stmt_summary}\n\n"
                 f"Iltimos, arizani namunadagidek to'g'ri va to'liq qilib qaytadan yozing (ustiga bossangiz nusxalanadi):\n\n"
                 f"✍️ <code>{esc_html(sample_buyer_stmt)}</code>"
             )
@@ -2794,16 +3070,8 @@ async def private_trade_chat_router(msg: Message, state: FSMContext):
     # 3. Sotuvchi kafolat arizasini tekshirish
     if deal["status"] == "seller_statement" and not is_buyer:
         sample_seller_stmt = "Men agar sotilgan narsani qaytarib olsam yoki aldov qilsam, qora ro'yxatga solishingizga roziman va to'liq javobgarlikni bo'ynimga olaman"
-        t_low = text_content.lower()
-        has_warranty = any(w in t_low for w in ["qora ro'yxat", "qora royxat", "qaytarib olsam", "aldov qilsam", "aldamayman", "javobgarlik", "kafolat beraman", "roziman va"])
 
-        is_valid_stmt = False
-        stmt_summary = ""
-        if has_warranty and len(text_content.strip()) >= 20:
-            is_valid_stmt = True
-            stmt_summary = "✅ Sotuvchi kafolat arizasi qabul qilindi."
-        else:
-            is_valid_stmt, stmt_summary = await verify_statement_with_ai_async(text_content, "seller", deal)
+        is_valid_stmt, stmt_summary = await verify_statement_with_ai_async(text_content, "seller", deal)
 
         if is_valid_stmt:
             db.q("UPDATE deals SET seller_statement=?, status='waiting_seller_card', updated_at=? WHERE deal_id=?", (text_content, now_s, deal["deal_id"]), commit=True)
@@ -2836,13 +3104,23 @@ async def private_trade_chat_router(msg: Message, state: FSMContext):
         else:
             await msg.reply(
                 f"❌ <b>Kafolat arizangiz qabul qilinmadi (Noto'g'ri yozildi)!</b>\n\n"
+                f"{stmt_summary}\n\n"
                 f"Iltimos, namunadagidek to'g'ri va to'liq qilib qaytadan yozing (ustiga bossangiz nusxalanadi):\n\n"
                 f"✍️ <code>{esc_html(sample_seller_stmt)}</code>"
             )
             return
 
     # 4. Sotuvchi shablonni to'ldirib yuborganda
-    if deal["status"] in ("waiting_seller_card", "completed") and not is_buyer and (not deal.get("seller_card") or deal.get("admin_payout_status") != "paid"):
+    if deal["status"] in ("waiting_seller_card", "completed") and not is_buyer:
+        # Karta allaqachon yuborilgan bo'lsa - faqat bir marta yuboriladi
+        if deal.get("seller_card"):
+            await msg.reply(
+                "ℹ️ <b>Sizning to'lov rekvizitlaringiz allaqachon qabul qilingan va adminga yuborilgan!</b>\n"
+                "Admin to'lovni o'tkazishi bilan sizga rasmiy to'lov cheki yuboriladi. "
+                "Iltimos, qayta yubormang va to'lovni kuting."
+            )
+            return
+
         card_num, owner_name, id_val, err = parse_seller_card_submission(text_content, msg.from_user.id)
         bot_info = await bot.get_me()
         bot_un = f"@{bot_info.username}" if bot_info and bot_info.username else "@Xavsizsavdobot"

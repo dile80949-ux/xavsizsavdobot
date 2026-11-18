@@ -75,6 +75,9 @@ def is_admin(user_id: int) -> bool:
         custom = db.get_setting("extra_admins", "")
         if custom and str(user_id) in [x.strip() for x in custom.split(",")]:
             return True
+        aid = db.get_setting("admin_id", "")
+        if aid and str(user_id) == aid.strip():
+            return True
     except Exception:
         pass
     return False

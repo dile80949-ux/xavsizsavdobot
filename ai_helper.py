@@ -320,29 +320,31 @@ def verify_statement_with_ai(statement_text: str, role: str, deal_info: Optional
     text = (statement_text or "").strip().lower()
     role = role.lower()
 
-    if len(text) < 3:
+    if len(text) < 10:
         return False, "⚠️ <b>AI Tahlili:</b> Tilxat-ariza matni juda qisqa yoki bo'sh."
 
     # XARIDOR ARIZASI TEKSHIRUVI
     if role in ("buyer", "xaridor", "oluvchi"):
-        # E'tiroz, shikoyat yoki rad alomatlari
+        # E'tiroz, shikoyat, inkor yoki rad alomatlari
         rejection_words = [
-            "yo'q", "olmadim", "bermadi", "xato", "noto'g'ri", "aldadi",
-            "ishlamadi", "da'voyim bor", "noroziman", "qaytaring", "ishlamayapti", "parol xato"
+            "qabul qilmayman", "qabul qilmadim", "olmayman", "olmadim", "bermadi", "berishmadi",
+            "bergani yo'q", "olganim yo'q", "yetib kelmadi", "aldadi", "aldov",
+            "firibgar", "scam", "yolg'on", "noto'g'ri", "notugri", "xato", "ishlamadi",
+            "ishlamayapti", "ochmayapti", "parol xato", "parol noto'g'ri", "kod kelmadi",
+            "da'voyim bor", "davoyim bor", "da'vom bor", "e'tirozim bor", "etirozim bor",
+            "noroziman", "rozi emasman", "rozimasman", "qaytaring", "qaytarib bering",
+            "bekor qiling", "bekor qil", "rad etaman", "da'vo qilaman"
         ]
         if any(w in text for w in rejection_words):
             return (
                 False,
-                "⚠️ <b>AI Tahlili:</b> Xaridor mahsulot to'liq olinmaganini yoki e'tirozi borligini bildirdi! "
-                "Savdo yakunlanmadi va mablag' kafil hisobida xavfsiz saqlanmoqda."
+                "⚠️ <b>AI Tahlili:</b> Xabarda inkor, e'tiroz yoki rad etish aniqlandi! Ariza qabul qilinmadi."
             )
 
-        # Ijobiy tasdiq alomatlari (keng qamrovli)
+        # Ijobiy tasdiq alomatlari (keng qamrovli va aniq)
         approval_words = [
-            "oldim", "qabul qildim", "tekshirdim", "rozi", "roziman", "da'voyim yo'q", "da'vom yo'q",
-            "bot javob bermaydi", "hammasi joyida", "hammasi to'g'ri", "o'tdi", "raxmat", "rahmat",
-            "to'liq qabul", "muammo yo'q", "ha oldim", "ishladi", "parol to'g'ri", "akkaunt oldim",
-            "kod keldi", "tasdiqlayman", "hammasi zo'r", "ha oldim rahmat"
+            "qabul qilib oldim", "to'liq qabul qilib oldim", "da'voyim yo'q", "davoyim yoq",
+            "da'vom yo'q", "davom yoq", "e'tirozim yo'q", "etirozim yoq", "bot javob bermaydi"
         ]
         if any(w in text for w in approval_words):
             return (
@@ -352,16 +354,24 @@ def verify_statement_with_ai(statement_text: str, role: str, deal_info: Optional
 
         return (
             False,
-            "⚠️ <b>AI Tahlili:</b> Kiritilgan matnda mahsulotni qabul qilib olganingiz aniq ifodalanmagan.\n"
-            "Iltimos, «Men mahsulotni to'liq qabul qilib oldim, e'tirozim yo'q» deb yozing."
+            "⚠️ <b>AI Tahlili:</b> Kiritilgan matnda mahsulotni to'liq qabul qilib olganingiz aniq tasdiqlanmagan.\n"
+            "Iltimos, namunadagi matnni to'liq yozing."
         )
 
     # SOTUVCHI ARIZASI TEKSHIRUVI
     elif role in ("seller", "sotuvchi"):
+        rejection_seller = [
+            "qaytarib olaman", "qora ro'yxatga solmang", "javob bermayman", "aldash", "aldov qilaman"
+        ]
+        if any(w in text for w in rejection_seller):
+            return (
+                False,
+                "⚠️ <b>AI Tahlili:</b> Sotuvchi kafolatida shubhali yoki inkor ma'no aniqlandi! Qabul qilinmadi."
+            )
+
         warranty_words = [
-            "qora ro'yxat", "qaytarib olsam", "aldov qilsam", "halol",
-            "topshirdim", "berdim", "kafolat beraman", "roziman", "javob beraman",
-            "qaytarib olmayman", "aldamayman", "kafolat"
+            "qora ro'yxat", "qora royxat", "qaytarib olsam", "aldov qilsam", "halol",
+            "kafolat beraman", "javobgarlik", "javob beraman"
         ]
         if any(w in text for w in warranty_words):
             return (
@@ -371,29 +381,54 @@ def verify_statement_with_ai(statement_text: str, role: str, deal_info: Optional
 
         return (
             False,
-            "⚠️ <b>AI Tahlili:</b> Sotuvchi kafolati aniq emas. Iltimos, «Agar mahsulotni qaytarib olsam yoki aldov qilsam, qora ro'yxatga solishingizga roziman» deb tasdiqlang."
+            "⚠️ <b>AI Tahlili:</b> Sotuvchi kafolati aniq emas. Iltimos, namunadagi matnni to'liq yozing."
         )
 
     return True, "Tasdiqlandi."
 
 async def verify_statement_with_ai_async(statement_text: str, role: str, deal_info: Optional[Dict[str, Any]] = None) -> Tuple[bool, str]:
-    """Gemini AI va Smart Local Brain orqali arizani tahlil qilish."""
+    """Gemini AI va Smart Local Brain orqali arizani sinchkov tahlil qilish."""
     client = get_genai_client()
+    s_clean = (statement_text or "").strip().lower()
+
+    # Oldindan qat'iy inkor so'zlarini tutib qolish
+    rejection_keywords = [
+        "qabul qilmayman", "qabul qilmadim", "olmayman", "olmadim", "bermadi", "berishmadi",
+        "da'voyim bor", "davoyim bor", "da'vom bor", "e'tirozim bor", "etirozim bor",
+        "aldadi", "aldov", "firibgar", "scam", "yolg'on", "noto'g'ri", "notugri", "xato",
+        "ishlamadi", "ishlamayapti", "ochmayapti", "parol noto'g'ri", "parol xato",
+        "noroziman", "rozi emasman", "rozimasman", "qaytaring", "qaytarib bering",
+        "bekor qiling", "bekor qil"
+    ]
+    for rk in rejection_keywords:
+        if rk in s_clean:
+            return False, f"⚠️ <b>AI Nazorati:</b> Xabarda e'tiroz yoki rad etish ma'nosi aniqlandi ('{rk}'). Ariza qabul qilinmadi!"
+
     if client:
         try:
             d_title = deal_info.get("title", "Tovar") if deal_info else "Tovar"
+            if role in ("buyer", "xaridor", "oluvchi"):
+                req_desc = "Xaridor tovarni/akkauntni to'liq qabul qilib olganini, hech qanday da'vosi yo'qligini va bot javob bermasligiga roziligini so'zsiz tasdiqlashi shart."
+            else:
+                req_desc = "Sotuvchi agar tovarni qaytarib olsa yoki aldasa, qora ro'yxatga tushishiga va javobgarlikka roziligini so'zsiz kafolatlashi shart."
+
             prompt = (
-                f"Siz kafolatli savdo boti moderatorisiz. Foydalanuvchi roli: '{role}'. Tovar: '{d_title}'.\n"
-                f"Foydalanuvchi yozgan xabar: \"{statement_text}\"\n\n"
-                f"Savol: Foydalanuvchi mahsulotni/akkauntni to'liq olganini yoki kafolat berganini tasdiqlayaptimi?\n"
-                f"Javob faqat bitta qatorda bo'lsin: TASDIQLANDI yoki RAD_ETILDI, va qisqa sababi."
+                f"Sen kafolatli savdo boti moderatorisan. Vazifang — foydalanuvchi yuborgan rasmiy tilxat matnini juda sinchkovlik bilan tekshirish.\n"
+                f"Foydalanuvchi roli: '{role}'. Savdo predmeti: '{d_title}'.\n"
+                f"Talab qilinadigan mazmun: {req_desc}\n\n"
+                f"Foydalanuvchi yuborgan xabar:\n\"\"\"{statement_text}\"\"\"\n\n"
+                f"QAT'IY QOIDALAR:\n"
+                f"1. Agar matnda inkor ('qabul qilmayman', 'olmadim', 'e'tirozim bor', 'aldadi'), kinoya, aldov yoki chalg'itish bo'lsa — darhol RAD_ETILDI deb javob ber!\n"
+                f"2. Faqat foydalanuvchi talab qilingan mazmunni to'liq va ijobiy tasdiqlagan bo'lsa — TASDIQLANDI deb javob ber.\n\n"
+                f"Javob bitta qatorda bo'lsin: TASDIQLANDI yoki RAD_ETILDI (va sababi)."
             )
             res = await asyncio.to_thread(client.models.generate_content, model=GEMINI_MODEL, contents=prompt)
             if res and res.text:
-                if "TASDIQLANDI" in res.text.upper():
-                    return True, f"✅ <b>AI Tasdiqladi:</b> {role.capitalize()} arizasi Gemini AI tomonidan tekshirilib, tasdiqlandi."
-                elif "RAD_ETILDI" in res.text.upper():
-                    return False, f"⚠️ <b>AI Tahlili:</b> Ariza rad etildi. {res.text}"
+                resp_str = res.text.strip()
+                if "TASDIQLANDI" in resp_str.upper() and "RAD_ETILDI" not in resp_str.upper():
+                    return True, f"✅ <b>AI Tasdiqladi:</b> {role.capitalize()} arizasi to'liq tekshirilib, tasdiqlandi."
+                else:
+                    return False, f"⚠️ <b>AI Tahlili:</b> Ariza rad etildi: {resp_str}"
         except Exception as e:
             logger.warning(f"verify_statement_with_ai_async xatosi: {e}")
 
